@@ -1,0 +1,53 @@
+{
+  "name": "mutegame-server",
+  "version": "1.0.0",
+  "description": "MuteGame Server & Admin Panel",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win --x64",
+    "build:mac": "electron-builder --mac",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^12.9.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.6.1",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "electron": "^29.1.0",
+    "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId": "com.mutegame.server",
+    "productName": "MuteGame Server",
+    "copyright": "MuteGame © 2024",
+    "directories": {
+      "output": "../dist/server"
+    },
+    "files": [
+      "main.js",
+      "server/**/*",
+      "admin-dist/**/*",
+      "node_modules/**/*",
+      "!node_modules/**/test*",
+      "!node_modules/**/*.md"
+    ],
+    "win": {
+      "target": [{ "target": "portable", "arch": ["x64"] }],
+      "icon": "assets/icon.png",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "portable": {
+      "artifactName": "MuteGame-Server.exe"
+    },
+    "mac": {
+      "target": "zip",
+      "category": "public.app-category.utilities"
+    }
+  }
+}

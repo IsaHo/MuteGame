@@ -1,0 +1,98 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install server dependencies
+        run: cd server && npm install
+
+      - name: Install & Build admin panel
+        run: |
+          cd admin
+          npm install
+          npm run build
+
+      - name: Copy admin build to server-app
+        run: |
+          mkdir -p server-app/admin-dist
+          xcopy /E /I /Y admin\dist server-app\admin-dist
+
+      - name: Copy server files to server-app
+        run: |
+          xcopy /E /I /Y server\*.js server-app\server\
+          xcopy /E /I /Y server\routes server-app\server\routes\
+
+      - name: Install server-app dependencies
+        run: cd server-app && npm install
+
+      - name: Build Server EXE
+        run: cd server-app && npx electron-builder --win --x64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install client dependencies
+        run: cd client && npm install
+
+      - name: Build client renderer
+        run: |
+          cd client/renderer
+          npm install
+          npx vite build
+
+      - name: Build Client EXE
+        run: cd client && npx electron-builder --win --x64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Server EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MuteGame-Server
+          path: server-app/dist/MuteGame-Server.exe
+
+      - name: Upload Client EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MuteGame-Client
+          path: client/dist/MuteGame-Client.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v1.0.0
+          name: "MuteGame v1.0.0"
+          body: |
+            ## 🎮 MuteGame - سیستم مدیریت گیم‌نت
+
+            ### دانلود:
+            - **`MuteGame-Server.exe`** → روی سیستم سرور/مدیر نصب کن
+            - **`MuteGame-Client.exe`** → روی همه کامپیوترهای گیم‌نت نصب کن
+
+            ### راه‌اندازی:
+            1. ابتدا `MuteGame-Server.exe` را اجرا کن
+            2. پنل ادمین خودکار باز می‌شه
+            3. یوزر پیش‌فرض: `admin` / رمز: `admin123`
+            4. روی هر PC کلاینت، `MuteGame-Client.exe` اجرا کن
+            5. IP سرور را وارد کن و وصل شو
+          files: |
+            server-app/dist/MuteGame-Server.exe
+            client/dist/MuteGame-Client.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

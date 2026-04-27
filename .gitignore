@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.db
+*.db-shm
+*.db-wal
+.env
+admin/dist/
+server-app/admin-dist/
+server-app/node_modules/
+client/dist/

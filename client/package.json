@@ -1,0 +1,57 @@
+{
+  "name": "mutegame-client",
+  "version": "1.0.0",
+  "description": "MuteGame Client - Windows",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "concurrently \"vite renderer --port 5173\" \"wait-on http://localhost:5173 && electron .\"",
+    "build:renderer": "vite build renderer",
+    "build": "npm run build:renderer && electron-builder"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.6.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "electron": "^29.1.0",
+    "electron-builder": "^26.8.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "vite": "^5.1.0",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.mutegame.client",
+    "productName": "MuteGame Client",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/dist/**/*",
+      "assets/**/*",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png"
+    },
+    "portable": {
+      "artifactName": "MuteGame-Client.exe"
+    },
+    "mac": {
+      "target": "zip",
+      "category": "public.app-category.entertainment"
+    }
+  }
+}
