@@ -38,6 +38,7 @@ export const api = {
   getUsers: () => req('/users'),
   createUser: (data) => req('/users', { method: 'POST', body: data }),
   updateUser: (id, data) => req(`/users/${id}`, { method: 'PUT', body: data }),
+  toggleUser: (id) => req(`/users/${id}/toggle`, { method: 'POST' }),
   deleteUser: (id) => req(`/users/${id}`, { method: 'DELETE' }),
   chargeUser: (id, amount, desc) => req(`/users/${id}/charge`, { method: 'POST', body: { amount, description: desc } }),
   getUserTransactions: (id) => req(`/users/${id}/transactions`),

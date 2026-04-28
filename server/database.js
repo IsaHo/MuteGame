@@ -24,6 +24,10 @@ function initDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
       password TEXT NOT NULL,
+      name TEXT DEFAULT '',
+      family TEXT DEFAULT '',
+      phone TEXT DEFAULT '',
+      is_active INTEGER DEFAULT 1,
       credits INTEGER DEFAULT 0,
       total_minutes INTEGER DEFAULT 0,
       total_spent REAL DEFAULT 0,
@@ -73,6 +77,13 @@ function initDatabase() {
       FOREIGN KEY (user_id) REFERENCES users(id)
     );
   `);
+
+  // Migrate existing users table - add new columns if missing
+  const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
+  if (!userCols.includes('name'))      db.exec("ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''");
+  if (!userCols.includes('family'))    db.exec("ALTER TABLE users ADD COLUMN family TEXT DEFAULT ''");
+  if (!userCols.includes('phone'))     db.exec("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''");
+  if (!userCols.includes('is_active')) db.exec("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1");
 
   const adminExists = db.prepare('SELECT id FROM admins WHERE username = ?').get('admin');
   if (!adminExists) {

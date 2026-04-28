@@ -1,8 +1,15 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: '/admin/',
-  server: { port: 3000, proxy: { '/api': 'http://localhost:3001', '/socket.io': { target: 'http://localhost:3001', ws: true } } },
-});
+  base: command === 'build' ? '/admin/' : '/',
+  server: {
+    port: 3000,
+    proxy: {
+      '/api': 'http://localhost:3001',
+      '/socket.io': { target: 'http://localhost:3001', ws: true }
+    }
+  },
+  build: { outDir: 'dist' }
+}));
