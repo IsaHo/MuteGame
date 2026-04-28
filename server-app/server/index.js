@@ -6,6 +6,7 @@ const { initDatabase, getDb } = require('./database');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const shopRoutes = require('./routes/shop');
+const settingsRoutes = require('./routes/settings');
 
 const app = express();
 const server = http.createServer(app);
@@ -28,6 +29,7 @@ app.set('connectedClients', connectedClients);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/shop', shopRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // Clients endpoint
 app.get('/api/clients', (req, res) => {
@@ -59,41 +61,73 @@ app.post('/api/clients/:socketId/extend', (req, res) => {
 });
 
 // Reports
+function dateFilter(days) {
+  if (days === 0) return "DATE(created_at, 'localtime') = DATE('now', 'localtime')";
+  return `created_at >= DATE('now', 'localtime', '-${days} days')`;
+}
+
 app.get('/api/reports/revenue', (req, res) => {
   const db = getDb();
-  const days = parseInt(req.query.days) || 7;
+  const days = parseInt(req.query.days);
+  const where = isNaN(days) ? dateFilter(7) : dateFilter(days);
   const revenue = db.prepare(`
-    SELECT DATE(created_at) as date, SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as charged,
+    SELECT DATE(created_at, 'localtime') as date,
+           SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as charged,
            COUNT(*) as transactions
     FROM credit_transactions
-    WHERE created_at >= DATE('now', '-' || ? || ' days')
-    GROUP BY DATE(created_at)
+    WHERE type = 'charge' AND ${where}
+    GROUP BY DATE(created_at, 'localtime')
     ORDER BY date ASC
-  `).all(days);
+  `).all();
   res.json(revenue);
 });
 
 app.get('/api/reports/shop', (req, res) => {
   const db = getDb();
-  const days = parseInt(req.query.days) || 7;
+  const days = parseInt(req.query.days);
+  const where = isNaN(days) ? dateFilter(7) : dateFilter(days);
   const sales = db.prepare(`
-    SELECT DATE(created_at) as date, SUM(total) as revenue, COUNT(*) as orders
+    SELECT DATE(created_at, 'localtime') as date,
+           SUM(total) as revenue,
+           COUNT(*) as orders
     FROM shop_orders
-    WHERE created_at >= DATE('now', '-' || ? || ' days')
-    GROUP BY DATE(created_at)
+    WHERE ${where}
+    GROUP BY DATE(created_at, 'localtime')
     ORDER BY date ASC
-  `).all(days);
+  `).all();
   res.json(sales);
+});
+
+// Shop profit report (sell - buy cost)
+app.get('/api/reports/shop-profit', (req, res) => {
+  const db = getDb();
+  const days = parseInt(req.query.days);
+  const where = isNaN(days) ? dateFilter(7) : dateFilter(days);
+  const orders = db.prepare(`SELECT items, total FROM shop_orders WHERE ${where}`).all();
+  let totalRevenue = 0, totalCost = 0, totalItems = 0;
+  orders.forEach(o => {
+    try {
+      const items = JSON.parse(o.items);
+      items.forEach(it => {
+        totalRevenue += (it.price || 0) * (it.qty || 1);
+        totalCost += (it.buy_price || 0) * (it.qty || 1);
+        totalItems += (it.qty || 1);
+      });
+    } catch {}
+  });
+  res.json({ totalRevenue, totalCost, grossProfit: totalRevenue - totalCost, totalItems, ordersCount: orders.length });
 });
 
 app.get('/api/reports/stats', (req, res) => {
   const db = getDb();
   const totalUsers = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-  const totalRevenue = db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE amount > 0").get().s || 0;
+  const totalRevenue = db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE amount > 0 AND type='charge'").get().s || 0;
   const totalShopRevenue = db.prepare("SELECT SUM(total) as s FROM shop_orders").get().s || 0;
-  const todayUsers = db.prepare("SELECT COUNT(DISTINCT user_id) as c FROM sessions WHERE DATE(start_time) = DATE('now')").get().c;
+  const todayRevenue = db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE amount > 0 AND type='charge' AND DATE(created_at,'localtime')=DATE('now','localtime')").get().s || 0;
+  const todayShop = db.prepare("SELECT SUM(total) as s FROM shop_orders WHERE DATE(created_at,'localtime')=DATE('now','localtime')").get().s || 0;
+  const todayUsers = db.prepare("SELECT COUNT(DISTINCT user_id) as c FROM sessions WHERE DATE(start_time,'localtime')=DATE('now','localtime')").get().c;
   const activeNow = Array.from(connectedClients.values()).filter(c => c.status === 'active').length;
-  res.json({ totalUsers, totalRevenue, totalShopRevenue, todayUsers, activeNow });
+  res.json({ totalUsers, totalRevenue, totalShopRevenue, todayRevenue, todayShop, todayUsers, activeNow });
 });
 
 // Session history

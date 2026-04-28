@@ -7,6 +7,7 @@ import Users from './pages/Users';
 import Shop from './pages/Shop';
 import Reports from './pages/Reports';
 import Accounting from './pages/Accounting';
+import Settings from './pages/Settings';
 import socket from './socket';
 
 export const ToastContext = createContext(null);
@@ -41,6 +42,7 @@ function Sidebar({ onlineCount }) {
     { to: '/shop', icon: '🛒', label: 'شاپ' },
     { to: '/accounting', icon: '📒', label: 'حسابداری' },
     { to: '/reports', icon: '📈', label: 'گزارشات' },
+    { to: '/settings', icon: '⚙️', label: 'تنظیمات' },
   ];
 
   return (
@@ -104,6 +106,7 @@ function Layout() {
             <Route path="/shop" element={<Shop addToast={addToast} />} />
             <Route path="/accounting" element={<Accounting addToast={addToast} />} />
             <Route path="/reports" element={<Reports addToast={addToast} />} />
+            <Route path="/settings" element={<Settings addToast={addToast} />} />
           </Routes>
         </div>
         <Toast toasts={toasts} />

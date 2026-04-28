@@ -9,16 +9,20 @@ router.get('/items', (req, res) => {
 });
 
 router.post('/items', (req, res) => {
-  const { name, price, category, emoji, stock } = req.body;
+  const { name, price, buy_price = 0, category, emoji, stock } = req.body;
   const db = getDb();
-  const result = db.prepare('INSERT INTO shop_items (name, price, category, emoji, stock) VALUES (?, ?, ?, ?, ?)').run(name, price, category || 'food', emoji || '🍔', stock ?? -1);
+  const result = db.prepare(
+    'INSERT INTO shop_items (name, price, buy_price, category, emoji, stock) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(name, price, buy_price, category || 'food', emoji || '🍔', stock ?? -1);
   res.json({ id: result.lastInsertRowid });
 });
 
 router.put('/items/:id', (req, res) => {
-  const { name, price, category, emoji, stock, active } = req.body;
+  const { name, price, buy_price = 0, category, emoji, stock, active } = req.body;
   const db = getDb();
-  db.prepare('UPDATE shop_items SET name=?, price=?, category=?, emoji=?, stock=?, active=? WHERE id=?').run(name, price, category, emoji, stock, active ?? 1, req.params.id);
+  db.prepare(
+    'UPDATE shop_items SET name=?, price=?, buy_price=?, category=?, emoji=?, stock=?, active=? WHERE id=?'
+  ).run(name, price, buy_price, category, emoji, stock, active ?? 1, req.params.id);
   res.json({ success: true });
 });
 
@@ -34,15 +38,18 @@ router.post('/orders', (req, res) => {
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');
 
+  // Validate stock + enrich items with buy_price
+  const enrichedItems = [];
   for (const item of items) {
     const dbItem = db.prepare('SELECT * FROM shop_items WHERE id = ?').get(item.id);
-    if (!dbItem) return res.status(400).json({ error: `آیتم یافت نشد` });
+    if (!dbItem) return res.status(400).json({ error: 'آیتم یافت نشد' });
     if (dbItem.stock !== -1 && dbItem.stock < item.qty) {
       return res.status(400).json({ error: `${dbItem.name} موجودی کافی ندارد` });
     }
     if (dbItem.stock !== -1) {
       db.prepare('UPDATE shop_items SET stock = stock - ? WHERE id = ?').run(item.qty, item.id);
     }
+    enrichedItems.push({ ...item, buy_price: dbItem.buy_price || 0 });
   }
 
   if (paymentMethod === 'credits' && userId) {
@@ -51,7 +58,8 @@ router.post('/orders', (req, res) => {
       return res.status(400).json({ error: 'اعتبار کافی ندارید' });
     }
     db.prepare('UPDATE users SET credits = credits - ? WHERE id = ?').run(total, userId);
-    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)').run(userId, -total, 'shop', `خرید از شاپ: ${items.map(i => i.name).join(', ')}`);
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(userId, -total, 'shop', `خرید از شاپ: ${items.map(i => i.name).join(', ')}`);
 
     const updatedUser = db.prepare('SELECT credits FROM users WHERE id = ?').get(userId);
     connectedClients.forEach((client, socketId) => {
@@ -62,7 +70,9 @@ router.post('/orders', (req, res) => {
     });
   }
 
-  const result = db.prepare('INSERT INTO shop_orders (user_id, computer_name, items, total, payment_method) VALUES (?, ?, ?, ?, ?)').run(userId || null, computerName || null, JSON.stringify(items), total, paymentMethod);
+  const result = db.prepare(
+    'INSERT INTO shop_orders (user_id, computer_name, items, total, payment_method) VALUES (?, ?, ?, ?, ?)'
+  ).run(userId || null, computerName || null, JSON.stringify(enrichedItems), total, paymentMethod);
   res.json({ id: result.lastInsertRowid });
 });
 

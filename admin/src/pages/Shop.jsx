@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, formatRial, formatDate } from '../api';
 
 const CATS = { all: 'همه', food: '🍔 غذا', drink: '🥤 نوشیدنی', snack: '🍟 اسنک' };
-const emptyItem = { name: '', price: '', category: 'food', emoji: '🍔', stock: -1, active: 1 };
+const emptyItem = { name: '', price: '', buy_price: '', category: 'food', emoji: '🍔', stock: -1, active: 1 };
 
 export default function Shop({ addToast }) {
   const [items, setItems] = useState([]);
@@ -199,13 +199,17 @@ export default function Shop({ addToast }) {
             <div className="card">
               <div className="table-wrap">
                 <table>
-                  <thead><tr><th>آیتم</th><th>دسته</th><th>قیمت</th><th>موجودی</th><th>وضعیت</th><th>عملیات</th></tr></thead>
+                  <thead><tr><th>آیتم</th><th>دسته</th><th>قیمت فروش</th><th>قیمت خرید</th><th>سود واحد</th><th>موجودی</th><th>وضعیت</th><th>عملیات</th></tr></thead>
                   <tbody>
-                    {items.map(it => (
+                    {items.map(it => {
+                      const profit = (it.price || 0) - (it.buy_price || 0);
+                      return (
                       <tr key={it.id}>
                         <td><span style={{ fontSize: 20, marginLeft: 8 }}>{it.emoji}</span>{it.name}</td>
                         <td><span className="badge badge-gray">{CATS[it.category] || it.category}</span></td>
                         <td style={{ fontWeight: 700, color: 'var(--cyan)' }}>{formatRial(it.price)}</td>
+                        <td style={{ color: 'var(--text3)' }}>{it.buy_price ? formatRial(it.buy_price) : '-'}</td>
+                        <td style={{ fontWeight: 700, color: profit > 0 ? 'var(--green)' : 'var(--text3)' }}>{it.buy_price ? formatRial(profit) : '-'}</td>
                         <td>{it.stock === -1 ? <span style={{ color: 'var(--text3)' }}>نامحدود</span> : <span style={{ fontWeight: 700 }}>{it.stock}</span>}</td>
                         <td>{it.active ? <span className="badge badge-green">فعال</span> : <span className="badge badge-red">غیرفعال</span>}</td>
                         <td>
@@ -215,7 +219,8 @@ export default function Shop({ addToast }) {
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -264,8 +269,12 @@ export default function Shop({ addToast }) {
                 <input className="input" value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} placeholder="نام غذا یا نوشیدنی" />
               </div>
               <div className="form-group">
-                <label className="label">قیمت (ریال)</label>
+                <label className="label">قیمت فروش (ریال)</label>
                 <input className="input" type="number" value={form.price} onChange={e => setForm(p => ({ ...p, price: e.target.value }))} placeholder="10000" />
+              </div>
+              <div className="form-group">
+                <label className="label">قیمت خرید (ریال)</label>
+                <input className="input" type="number" value={form.buy_price} onChange={e => setForm(p => ({ ...p, buy_price: e.target.value }))} placeholder="6000" />
               </div>
               <div className="form-group">
                 <label className="label">ایموجی</label>

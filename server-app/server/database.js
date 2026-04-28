@@ -49,11 +49,18 @@ function initDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       price REAL NOT NULL,
+      buy_price REAL DEFAULT 0,
       category TEXT DEFAULT 'food',
       emoji TEXT DEFAULT '🍔',
       stock INTEGER DEFAULT -1,
       active INTEGER DEFAULT 1,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS shop_orders (
@@ -78,12 +85,29 @@ function initDatabase() {
     );
   `);
 
-  // Migrate existing users table - add new columns if missing
+  // Migrate existing tables
   const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
   if (!userCols.includes('name'))      db.exec("ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''");
   if (!userCols.includes('family'))    db.exec("ALTER TABLE users ADD COLUMN family TEXT DEFAULT ''");
   if (!userCols.includes('phone'))     db.exec("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''");
   if (!userCols.includes('is_active')) db.exec("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1");
+
+  const shopCols = db.prepare("PRAGMA table_info(shop_items)").all().map(c => c.name);
+  if (!shopCols.includes('buy_price')) db.exec("ALTER TABLE shop_items ADD COLUMN buy_price REAL DEFAULT 0");
+
+  // Default settings
+  const defaultSettings = [
+    ['gaming_price_per_minute', '500'],
+    ['gaming_peak_multiplier', '1.5'],
+    ['gaming_peak_start', '16'],
+    ['gaming_peak_end', '24'],
+    ['cafe_name', 'MuteGame'],
+    ['cafe_address', ''],
+    ['cafe_phone', ''],
+    ['currency', 'ریال'],
+  ];
+  const upsertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  defaultSettings.forEach(([k, v]) => upsertSetting.run(k, v));
 
   const adminExists = db.prepare('SELECT id FROM admins WHERE username = ?').get('admin');
   if (!adminExists) {

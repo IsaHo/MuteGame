@@ -60,8 +60,13 @@ export const api = {
   // Reports
   getRevenueReport: (days) => req(`/reports/revenue?days=${days}`),
   getShopReport: (days) => req(`/reports/shop?days=${days}`),
+  getShopProfit: (days) => req(`/reports/shop-profit?days=${days}`),
   getStats: () => req('/reports/stats'),
   getSessions: () => req('/sessions'),
+
+  // Settings
+  getSettings: () => req('/settings'),
+  saveSettings: (data) => req('/settings', { method: 'POST', body: data }),
 
   // Accounting
   getAccountingData: (days) => Promise.all([

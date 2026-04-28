@@ -42,6 +42,7 @@ export default function Reports({ addToast }) {
       <div className="topbar">
         <span className="topbar-title">📈 گزارشات</span>
         <div className="topbar-right">
+          <button className={`btn btn-sm ${period === 0 ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setPeriod(0)}>امروز</button>
           {[7, 30, 90].map(d => (
             <button key={d} className={`btn btn-sm ${period === d ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setPeriod(d)}>{d} روز</button>
           ))}

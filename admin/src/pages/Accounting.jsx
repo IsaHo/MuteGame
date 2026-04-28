@@ -15,6 +15,7 @@ export default function Accounting({ addToast }) {
   const [period, setPeriod] = useState(30);
   const [revenueData, setRevenueData] = useState([]);
   const [shopData, setShopData] = useState([]);
+  const [shopProfit, setShopProfit] = useState({});
   const [stats, setStats] = useState({});
   const [expenses, setExpenses] = useState(loadExpenses());
   const [tab, setTab] = useState('overview'); // overview | income | expenses | cashflow | print
@@ -26,16 +27,18 @@ export default function Accounting({ addToast }) {
 
   const load = async () => {
     try {
-      const [rev, shop, st, ords] = await Promise.all([
+      const [rev, shop, st, ords, profit] = await Promise.all([
         api.getRevenueReport(period),
         api.getShopReport(period),
         api.getStats(),
         api.getOrders(),
+        api.getShopProfit(period),
       ]);
       setRevenueData(rev);
       setShopData(shop);
       setStats(st);
       setOrders(ords);
+      setShopProfit(profit);
 
       // Load transactions for income detail
       const users = await api.getUsers();
@@ -51,6 +54,7 @@ export default function Accounting({ addToast }) {
   const totalIncome = totalChargeRevenue + totalShopRevenue;
 
   const periodExpenses = expenses.filter(e => {
+    if (period === 0) return e.date === new Date().toISOString().split('T')[0];
     const eDate = new Date(e.date);
     const from = new Date(); from.setDate(from.getDate() - period);
     return eDate >= from;
@@ -121,7 +125,7 @@ export default function Accounting({ addToast }) {
         .profit.neg { background: #fee2e2; color: #991b1b; border: 2px solid #ef4444; }
       </style></head><body>
       <h1>🎮 گزارش مالی MuteGame</h1>
-      <p class="sub">بازه: ${period} روز اخیر | تاریخ چاپ: ${new Date().toLocaleDateString('fa-IR')}</p>
+      <p class="sub">بازه: ${period === 0 ? 'امروز' : period + ' روز اخیر'} | تاریخ چاپ: ${new Date().toLocaleDateString('fa-IR')}</p>
 
       <div class="grid">
         <div class="box"><h3>درآمد شارژ</h3><div class="val purple">${totalChargeRevenue.toLocaleString('fa-IR')} ریال</div></div>
@@ -168,6 +172,7 @@ export default function Accounting({ addToast }) {
         <span className="topbar-title">📒 حسابداری</span>
         <div className="topbar-right">
           <div style={{ display: 'flex', gap: 4 }}>
+            <button className={`btn btn-sm ${period === 0 ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setPeriod(0)}>امروز</button>
             {[7, 30, 90].map(d => (
               <button key={d} className={`btn btn-sm ${period === d ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setPeriod(d)}>{d} روز</button>
             ))}
@@ -187,17 +192,18 @@ export default function Accounting({ addToast }) {
         {tab === 'overview' && (
           <>
             {/* KPI Cards */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 14, marginBottom: 24 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 14, marginBottom: 24 }}>
               {[
                 { label: 'درآمد شارژ', value: formatRial(totalChargeRevenue), icon: '🔋', color: 'purple' },
                 { label: 'درآمد شاپ', value: formatRial(totalShopRevenue), icon: '🛒', color: 'cyan' },
+                { label: 'سود خالص شاپ', value: formatRial(shopProfit.grossProfit || 0), icon: '📦', color: (shopProfit.grossProfit || 0) >= 0 ? 'green' : 'red' },
                 { label: 'کل درآمد', value: formatRial(totalIncome), icon: '💰', color: 'green' },
                 { label: 'کل هزینه', value: formatRial(totalExpenses), icon: '💸', color: 'yellow' },
                 { label: 'سود خالص', value: formatRial(netProfit), icon: netProfit >= 0 ? '📈' : '📉', color: netProfit >= 0 ? 'green' : 'red' },
               ].map(k => (
                 <div key={k.label} className={`stat-card ${k.color}`}>
                   <div className={`stat-icon ${k.color}`} style={{ fontSize: 22 }}>{k.icon}</div>
-                  <div className="stat-value" style={{ fontSize: 15, marginBottom: 2 }}>{k.value}</div>
+                  <div className="stat-value" style={{ fontSize: 14, marginBottom: 2 }}>{k.value}</div>
                   <div className="stat-label">{k.label}</div>
                 </div>
               ))}
@@ -215,7 +221,7 @@ export default function Accounting({ addToast }) {
               justifyContent: 'space-between',
             }}>
               <div>
-                <div style={{ fontSize: 13, color: 'var(--text3)', marginBottom: 4 }}>سود خالص {period} روز اخیر</div>
+                <div style={{ fontSize: 13, color: 'var(--text3)', marginBottom: 4 }}>سود خالص {period === 0 ? 'امروز' : `${period} روز اخیر`}</div>
                 <div style={{ fontSize: 32, fontWeight: 900, color: netProfit >= 0 ? 'var(--green)' : 'var(--red)' }}>
                   {netProfit >= 0 ? '+' : ''}{formatRial(netProfit)}
                 </div>
@@ -260,6 +266,26 @@ export default function Accounting({ addToast }) {
                 )}
               </div>
             </div>
+
+            {/* Shop Profit Breakdown */}
+            {(shopProfit.ordersCount > 0) && (
+              <div className="card" style={{ marginBottom: 16 }}>
+                <p className="chart-title">📦 سود و زیان شاپ (فروش - بهای تمام‌شده)</p>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+                  {[
+                    { label: 'درآمد فروش', value: shopProfit.totalRevenue || 0, color: 'var(--cyan)' },
+                    { label: 'بهای تمام‌شده', value: shopProfit.totalCost || 0, color: 'var(--red)' },
+                    { label: 'سود ناخالص', value: shopProfit.grossProfit || 0, color: (shopProfit.grossProfit || 0) >= 0 ? 'var(--green)' : 'var(--red)' },
+                    { label: 'تعداد آیتم فروخته', value: `${(shopProfit.totalItems || 0).toLocaleString('fa-IR')} عدد`, color: 'var(--text)', isText: true },
+                  ].map(s => (
+                    <div key={s.label} style={{ background: 'var(--bg2)', borderRadius: 10, padding: '14px 16px', border: '1px solid var(--border)', textAlign: 'center' }}>
+                      <div style={{ fontSize: 12, color: 'var(--text3)', marginBottom: 6 }}>{s.label}</div>
+                      <div style={{ fontWeight: 800, fontSize: 15, color: s.color }}>{s.isText ? s.value : formatRial(s.value)}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Expense breakdown */}
             {expByCat.length > 0 && (
