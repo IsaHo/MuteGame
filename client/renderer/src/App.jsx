@@ -14,14 +14,16 @@ const ipc = window.electron || {
 };
 
 export default function App() {
-  const [state, setState] = useState('loading'); // loading | config | login | active | locked
+  const [state, setState] = useState('loading');
   const [config, setConfig] = useState(null);
   const [socket, setSocket] = useState(null);
   const [user, setUser] = useState(null);
   const [credits, setCredits] = useState(0);
+  const [debt, setDebt] = useState(0);
   const [sessionStart, setSessionStart] = useState(null);
   const [notification, setNotification] = useState(null);
   const [shopItems, setShopItems] = useState([]);
+  const [gameSettings, setGameSettings] = useState({ gaming_price_per_hour: 30000 });
 
   const showNotif = useCallback((msg, dur = 4000) => {
     setNotification(msg);
@@ -40,26 +42,37 @@ export default function App() {
     const sock = io(cfg.serverUrl, { transports: ['websocket'], reconnection: true, reconnectionDelay: 3000 });
 
     sock.on('connect', () => {
-      console.log('Connected to server');
       sock.emit('client:register', { computerId: cfg.computerName, computerName: cfg.computerName });
       setState('login');
+
+      // Load settings and shop items
+      fetch(`${cfg.serverUrl}/api/settings`).then(r => r.json()).then(s => setGameSettings(s)).catch(() => {});
+      fetch(`${cfg.serverUrl}/api/shop/items`).then(r => r.json()).then(items => setShopItems(items.filter(i => i.active))).catch(() => {});
     });
 
     sock.on('connect_error', () => setState('config'));
 
-    sock.on('credits:update', ({ credits: c }) => {
+    sock.on('credits:update', ({ credits: c, debt: d }) => {
       setCredits(c);
-      if (c <= 5 && c > 0) showNotif(`⚠️ فقط ${c} دقیقه اعتبار دارید! شارژ کنید.`);
+      if (d !== undefined) setDebt(d);
+      const pricePerHour = Number(gameSettings.gaming_price_per_hour || 30000);
+      if (c <= pricePerHour && c > 0) {
+        const minsLeft = Math.floor(c / (pricePerHour / 60));
+        showNotif(`⚠️ فقط ${minsLeft} دقیقه اعتبار دارید! شارژ کنید.`);
+      }
     });
 
     sock.on('credits:low', ({ credits: c }) => {
-      showNotif(`⏰ اعتبار شما کم است: ${c} دقیقه`, 6000);
+      const pricePerHour = Number(gameSettings.gaming_price_per_hour || 30000);
+      const minsLeft = Math.floor(c / (pricePerHour / 60));
+      showNotif(`⏰ اعتبار کم است: ${minsLeft} دقیقه`, 6000);
     });
 
     sock.on('session:end', ({ reason }) => {
       if (reason === 'no_credits') showNotif('⛔ اعتبار شما تمام شد!', 5000);
       else if (reason === 'admin_kick') showNotif('⚡ جلسه توسط ادمین پایان یافت', 5000);
-      setUser(null); setCredits(0); setSessionStart(null);
+      else if (reason === 'account_disabled') showNotif('⛔ حساب شما غیرفعال شد', 5000);
+      setUser(null); setCredits(0); setDebt(0); setSessionStart(null);
       setState('locked');
       ipc.lockScreen();
     });
@@ -68,15 +81,21 @@ export default function App() {
       showNotif(`📢 پیام از ادمین: ${text}`, 8000);
     });
 
-    setSocket(sock);
+    sock.on('order:approved', () => {
+      showNotif('✅ سفارش شما تایید شد! به زودی تحویل داده می‌شه 🚀', 6000);
+    });
 
-    // Load shop items
-    fetch(`${cfg.serverUrl}/api/shop/items`).then(r => r.json()).then(items => setShopItems(items.filter(i => i.active))).catch(() => { });
+    sock.on('order:cancelled', () => {
+      showNotif('❌ سفارش شما لغو شد. با ادمین تماس بگیرید.', 6000);
+    });
+
+    setSocket(sock);
   };
 
   const handleLogin = useCallback((userData) => {
     setUser(userData);
     setCredits(userData.credits);
+    setDebt(userData.debt || 0);
     setSessionStart(new Date());
     setState('active');
     ipc.unlockScreen();
@@ -87,27 +106,19 @@ export default function App() {
         username: userData.username,
         credits: userData.credits,
       });
-
-      // Start session on server
-      fetch(`${config.serverUrl}/api/sessions/start`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: userData.id, computerName: config.computerName }),
-      }).catch(() => { });
     }
-    showNotif(`🎮 خوش آمدید ${userData.username}! ${userData.credits} دقیقه اعتبار دارید.`);
-  }, [socket, config]);
+    const pricePerHour = Number(gameSettings.gaming_price_per_hour || 30000);
+    const minsLeft = Math.floor(userData.credits / (pricePerHour / 60));
+    showNotif(`🎮 خوش آمدید ${userData.username}! حدود ${minsLeft} دقیقه اعتبار دارید.`);
+  }, [socket, config, gameSettings]);
 
   const handleLogout = useCallback(() => {
     if (!user) return;
     socket?.emit('client:logout');
-    fetch(`${config.serverUrl}/api/sessions/end`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: user.id }),
-    }).catch(() => { });
-    setUser(null); setCredits(0); setSessionStart(null);
+    setUser(null); setCredits(0); setDebt(0); setSessionStart(null);
     setState('locked');
     ipc.lockScreen();
-  }, [user, socket, config]);
+  }, [user, socket]);
 
   const saveConfig = async (newCfg) => {
     await ipc.saveConfig(newCfg);
@@ -136,9 +147,11 @@ export default function App() {
         <Desktop
           user={user}
           credits={credits}
+          debt={debt}
           sessionStart={sessionStart}
           shopItems={shopItems}
           serverUrl={config?.serverUrl}
+          gameSettings={gameSettings}
           onLogout={handleLogout}
         />
       )}

@@ -36,11 +36,15 @@ export const api = {
 
   // Users
   getUsers: () => req('/users'),
+  getBadPayers: () => req('/users/bad-payers'),
   createUser: (data) => req('/users', { method: 'POST', body: data }),
   updateUser: (id, data) => req(`/users/${id}`, { method: 'PUT', body: data }),
   toggleUser: (id) => req(`/users/${id}/toggle`, { method: 'POST' }),
   deleteUser: (id) => req(`/users/${id}`, { method: 'DELETE' }),
   chargeUser: (id, amount, desc) => req(`/users/${id}/charge`, { method: 'POST', body: { amount, description: desc } }),
+  dechargeUser: (id, amount, desc) => req(`/users/${id}/decharge`, { method: 'POST', body: { amount, description: desc } }),
+  addDebt: (id, amount, desc) => req(`/users/${id}/debt/add`, { method: 'POST', body: { amount, description: desc } }),
+  payDebt: (id, amount, desc) => req(`/users/${id}/debt/pay`, { method: 'POST', body: { amount, description: desc } }),
   getUserTransactions: (id) => req(`/users/${id}/transactions`),
 
   // Clients
@@ -55,7 +59,9 @@ export const api = {
   updateShopItem: (id, data) => req(`/shop/items/${id}`, { method: 'PUT', body: data }),
   deleteShopItem: (id) => req(`/shop/items/${id}`, { method: 'DELETE' }),
   createOrder: (data) => req('/shop/orders', { method: 'POST', body: data }),
-  getOrders: () => req('/shop/orders'),
+  getOrders: (status) => req('/shop/orders' + (status ? `?status=${status}` : '')),
+  approveOrder: (id) => req(`/shop/orders/${id}/approve`, { method: 'POST' }),
+  cancelOrder: (id) => req(`/shop/orders/${id}/cancel`, { method: 'POST' }),
 
   // Reports
   getRevenueReport: (days) => req(`/reports/revenue?days=${days}`),

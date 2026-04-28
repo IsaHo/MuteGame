@@ -28,9 +28,12 @@ function initDatabase() {
       family TEXT DEFAULT '',
       phone TEXT DEFAULT '',
       is_active INTEGER DEFAULT 1,
-      credits INTEGER DEFAULT 0,
+      credits REAL DEFAULT 0,
       total_minutes INTEGER DEFAULT 0,
       total_spent REAL DEFAULT 0,
+      debt REAL DEFAULT 0,
+      debt_since DATETIME,
+      discount_percent REAL DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_login DATETIME
     );
@@ -70,7 +73,7 @@ function initDatabase() {
       items TEXT NOT NULL,
       total REAL NOT NULL,
       payment_method TEXT DEFAULT 'cash',
-      status TEXT DEFAULT 'completed',
+      status TEXT DEFAULT 'pending',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -87,17 +90,23 @@ function initDatabase() {
 
   // Migrate existing tables
   const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
-  if (!userCols.includes('name'))      db.exec("ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''");
-  if (!userCols.includes('family'))    db.exec("ALTER TABLE users ADD COLUMN family TEXT DEFAULT ''");
-  if (!userCols.includes('phone'))     db.exec("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''");
-  if (!userCols.includes('is_active')) db.exec("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1");
+  if (!userCols.includes('name'))             db.exec("ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''");
+  if (!userCols.includes('family'))           db.exec("ALTER TABLE users ADD COLUMN family TEXT DEFAULT ''");
+  if (!userCols.includes('phone'))            db.exec("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''");
+  if (!userCols.includes('is_active'))        db.exec("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1");
+  if (!userCols.includes('debt'))             db.exec("ALTER TABLE users ADD COLUMN debt REAL DEFAULT 0");
+  if (!userCols.includes('debt_since'))       db.exec("ALTER TABLE users ADD COLUMN debt_since DATETIME");
+  if (!userCols.includes('discount_percent')) db.exec("ALTER TABLE users ADD COLUMN discount_percent REAL DEFAULT 0");
 
   const shopCols = db.prepare("PRAGMA table_info(shop_items)").all().map(c => c.name);
   if (!shopCols.includes('buy_price')) db.exec("ALTER TABLE shop_items ADD COLUMN buy_price REAL DEFAULT 0");
 
+  const orderCols = db.prepare("PRAGMA table_info(shop_orders)").all().map(c => c.name);
+  if (!orderCols.includes('status')) db.exec("ALTER TABLE shop_orders ADD COLUMN status TEXT DEFAULT 'pending'");
+
   // Default settings
   const defaultSettings = [
-    ['gaming_price_per_minute', '500'],
+    ['gaming_price_per_hour', '30000'],
     ['gaming_peak_multiplier', '1.5'],
     ['gaming_peak_start', '16'],
     ['gaming_peak_end', '24'],
@@ -105,6 +114,10 @@ function initDatabase() {
     ['cafe_address', ''],
     ['cafe_phone', ''],
     ['currency', 'ریال'],
+    ['tier1_discount', '10'],
+    ['tier2_discount', '5'],
+    ['tier3_discount', '2'],
+    ['bad_payer_days', '7'],
   ];
   const upsertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   defaultSettings.forEach(([k, v]) => upsertSetting.run(k, v));
@@ -119,22 +132,22 @@ function initDatabase() {
   const itemCount = db.prepare('SELECT COUNT(*) as cnt FROM shop_items').get();
   if (itemCount.cnt === 0) {
     const items = [
-      ['ساندویچ مرغ', 25000, 'food', '🥪', 50],
-      ['پیتزا', 45000, 'food', '🍕', 30],
-      ['همبرگر', 35000, 'food', '🍔', 40],
-      ['هات‌داگ', 20000, 'food', '🌭', 45],
-      ['نوشابه', 10000, 'drink', '🥤', 100],
-      ['آب معدنی', 5000, 'drink', '💧', 200],
-      ['دوغ', 8000, 'drink', '🧋', 80],
-      ['قهوه', 20000, 'drink', '☕', 40],
-      ['چای', 8000, 'drink', '🍵', 100],
-      ['انرژی‌زا', 25000, 'drink', '⚡', 60],
-      ['چیپس', 12000, 'snack', '🍟', 80],
-      ['شکلات', 15000, 'snack', '🍫', 50],
-      ['آجیل', 18000, 'snack', '🥜', 40],
-      ['پاپ‌کورن', 10000, 'snack', '🍿', 60],
+      ['ساندویچ مرغ', 25000, 5000, 'food', '🥪', 50],
+      ['پیتزا', 45000, 15000, 'food', '🍕', 30],
+      ['همبرگر', 35000, 10000, 'food', '🍔', 40],
+      ['هات‌داگ', 20000, 6000, 'food', '🌭', 45],
+      ['نوشابه', 10000, 3000, 'drink', '🥤', 100],
+      ['آب معدنی', 5000, 1500, 'drink', '💧', 200],
+      ['دوغ', 8000, 2500, 'drink', '🧋', 80],
+      ['قهوه', 20000, 7000, 'drink', '☕', 40],
+      ['چای', 8000, 2000, 'drink', '🍵', 100],
+      ['انرژی‌زا', 25000, 8000, 'drink', '⚡', 60],
+      ['چیپس', 12000, 4000, 'snack', '🍟', 80],
+      ['شکلات', 15000, 5000, 'snack', '🍫', 50],
+      ['آجیل', 18000, 6000, 'snack', '🥜', 40],
+      ['پاپ‌کورن', 10000, 3000, 'snack', '🍿', 60],
     ];
-    const insert = db.prepare('INSERT INTO shop_items (name, price, category, emoji, stock) VALUES (?, ?, ?, ?, ?)');
+    const insert = db.prepare('INSERT INTO shop_items (name, price, buy_price, category, emoji, stock) VALUES (?, ?, ?, ?, ?, ?)');
     items.forEach(item => insert.run(...item));
     console.log('✅ Default shop items added');
   }

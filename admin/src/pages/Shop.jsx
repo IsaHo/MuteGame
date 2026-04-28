@@ -4,7 +4,7 @@ import { api, formatRial, formatDate } from '../api';
 const CATS = { all: 'همه', food: '🍔 غذا', drink: '🥤 نوشیدنی', snack: '🍟 اسنک' };
 const emptyItem = { name: '', price: '', buy_price: '', category: 'food', emoji: '🍔', stock: -1, active: 1 };
 
-export default function Shop({ addToast }) {
+export default function Shop({ addToast, pendingOrders = [], onApproveOrder, onCancelOrder }) {
   const [items, setItems] = useState([]);
   const [orders, setOrders] = useState([]);
   const [cart, setCart] = useState([]);
@@ -90,9 +90,15 @@ export default function Shop({ addToast }) {
         <div className="topbar-right">
           <span style={{ fontSize: 12, color: 'var(--text3)' }}>فروش امروز: <strong style={{ color: 'var(--green)' }}>{formatRial(todaySales)}</strong></span>
           <div style={{ display: 'flex', gap: 4 }}>
-            {['pos', 'items', 'orders'].map(t => (
-              <button key={t} className={`btn btn-sm ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}>
-                {t === 'pos' ? '🛒 فروش' : t === 'items' ? '📦 موجودی' : '📋 سفارشات'}
+            {['pos', 'items', 'orders', 'pending'].map(t => (
+              <button key={t} className={`btn btn-sm ${tab === t ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setTab(t)}
+                style={{ position: 'relative' }}>
+                {t === 'pos' ? '🛒 فروش' : t === 'items' ? '📦 موجودی' : t === 'orders' ? '📋 سفارشات' : '⏳ در انتظار'}
+                {t === 'pending' && pendingOrders.length > 0 && (
+                  <span style={{ position: 'absolute', top: -4, right: -4, background: 'var(--yellow)', color: '#000', width: 16, height: 16, borderRadius: '50%', fontSize: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 900 }}>
+                    {pendingOrders.length}
+                  </span>
+                )}
               </button>
             ))}
           </div>
@@ -257,6 +263,52 @@ export default function Shop({ addToast }) {
           </div>
         )}
       </div>
+
+        {/* Pending Orders */}
+        {tab === 'pending' && (
+          <div>
+            {pendingOrders.length === 0 ? (
+              <div className="card" style={{ textAlign: 'center', padding: 50 }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+                <div style={{ color: 'var(--text3)' }}>هیچ سفارش در انتظاری وجود ندارد</div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {pendingOrders.map(o => (
+                  <div key={o.id} className="card" style={{ border: '1px solid rgba(245,158,11,0.3)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                      <div>
+                        <div style={{ fontWeight: 800, fontSize: 15 }}>
+                          🖥️ {o.computer_name || 'نامشخص'}
+                          {o.username && <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--text3)', marginRight: 10 }}>کاربر: {o.username}</span>}
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 4 }}>{formatDate(o.created_at)}</div>
+                      </div>
+                      <span className={`badge ${o.payment_method === 'credits' ? 'badge-purple' : 'badge-yellow'}`}>
+                        {o.payment_method === 'credits' ? '⭐ از شارژ' : '💵 نقدی'}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                      {(o.items || []).map((item, i) => (
+                        <div key={i} style={{ background: 'var(--bg2)', borderRadius: 8, padding: '6px 12px', fontSize: 13, border: '1px solid var(--border)' }}>
+                          {item.emoji} {item.name} <strong>×{item.qty}</strong>
+                          <span style={{ color: 'var(--text3)', marginRight: 6 }}>{formatRial(item.price * item.qty)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div style={{ fontWeight: 900, fontSize: 18, color: 'var(--green)' }}>{formatRial(o.total)}</div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button className="btn btn-red btn-sm" onClick={() => onCancelOrder(o.id)}>❌ لغو سفارش</button>
+                        <button className="btn btn-primary" onClick={() => onApproveOrder(o.id)}>✅ تایید و ارسال</button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
       {/* Item Modal */}
       {itemModal !== null && (

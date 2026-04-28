@@ -19,19 +19,16 @@ app.use(express.json());
 
 initDatabase();
 
-// Map: socketId -> client info
 const connectedClients = new Map();
 
 app.set('io', io);
 app.set('connectedClients', connectedClients);
 
-// Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/shop', shopRoutes);
 app.use('/api/settings', settingsRoutes);
 
-// Clients endpoint
 app.get('/api/clients', (req, res) => {
   res.json(Array.from(connectedClients.values()));
 });
@@ -52,9 +49,9 @@ app.post('/api/clients/:socketId/extend', (req, res) => {
   if (client && client.userId) {
     const db = getDb();
     db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(minutes, client.userId);
-    const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(client.userId);
+    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(client.userId);
     client.credits = user.credits;
-    io.to(req.params.socketId).emit('credits:update', { credits: user.credits });
+    io.to(req.params.socketId).emit('credits:update', { credits: user.credits, debt: user.debt });
     io.emit('clients:update', Array.from(connectedClients.values()));
   }
   res.json({ success: true });
@@ -63,7 +60,7 @@ app.post('/api/clients/:socketId/extend', (req, res) => {
 // Reports
 function dateFilter(days) {
   if (days === 0) return "DATE(created_at, 'localtime') = DATE('now', 'localtime')";
-  return `created_at >= DATE('now', 'localtime', '-${days} days')`;
+  return `created_at >= datetime('now', 'localtime', '-${days} days')`;
 }
 
 app.get('/api/reports/revenue', (req, res) => {
@@ -91,19 +88,18 @@ app.get('/api/reports/shop', (req, res) => {
            SUM(total) as revenue,
            COUNT(*) as orders
     FROM shop_orders
-    WHERE ${where}
+    WHERE status = 'completed' AND ${where}
     GROUP BY DATE(created_at, 'localtime')
     ORDER BY date ASC
   `).all();
   res.json(sales);
 });
 
-// Shop profit report (sell - buy cost)
 app.get('/api/reports/shop-profit', (req, res) => {
   const db = getDb();
   const days = parseInt(req.query.days);
   const where = isNaN(days) ? dateFilter(7) : dateFilter(days);
-  const orders = db.prepare(`SELECT items, total FROM shop_orders WHERE ${where}`).all();
+  const orders = db.prepare(`SELECT items, total FROM shop_orders WHERE status = 'completed' AND ${where}`).all();
   let totalRevenue = 0, totalCost = 0, totalItems = 0;
   orders.forEach(o => {
     try {
@@ -122,15 +118,15 @@ app.get('/api/reports/stats', (req, res) => {
   const db = getDb();
   const totalUsers = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
   const totalRevenue = db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE amount > 0 AND type='charge'").get().s || 0;
-  const totalShopRevenue = db.prepare("SELECT SUM(total) as s FROM shop_orders").get().s || 0;
+  const totalShopRevenue = db.prepare("SELECT SUM(total) as s FROM shop_orders WHERE status='completed'").get().s || 0;
   const todayRevenue = db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE amount > 0 AND type='charge' AND DATE(created_at,'localtime')=DATE('now','localtime')").get().s || 0;
-  const todayShop = db.prepare("SELECT SUM(total) as s FROM shop_orders WHERE DATE(created_at,'localtime')=DATE('now','localtime')").get().s || 0;
+  const todayShop = db.prepare("SELECT SUM(total) as s FROM shop_orders WHERE status='completed' AND DATE(created_at,'localtime')=DATE('now','localtime')").get().s || 0;
   const todayUsers = db.prepare("SELECT COUNT(DISTINCT user_id) as c FROM sessions WHERE DATE(start_time,'localtime')=DATE('now','localtime')").get().c;
   const activeNow = Array.from(connectedClients.values()).filter(c => c.status === 'active').length;
-  res.json({ totalUsers, totalRevenue, totalShopRevenue, todayRevenue, todayShop, todayUsers, activeNow });
+  const pendingOrders = db.prepare("SELECT COUNT(*) as c FROM shop_orders WHERE status='pending'").get().c;
+  res.json({ totalUsers, totalRevenue, totalShopRevenue, todayRevenue, todayShop, todayUsers, activeNow, pendingOrders });
 });
 
-// Session history
 app.get('/api/sessions', (req, res) => {
   const db = getDb();
   const sessions = db.prepare(`
@@ -165,9 +161,7 @@ io.on('connection', (socket) => {
     if (!client) return;
     const db = getDb();
 
-    // End any existing open session for this user
     db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(data.userId);
-    // Start new session
     db.prepare('INSERT INTO sessions (user_id, computer_name) VALUES (?, ?)').run(data.userId, client.computerName);
     db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(data.userId);
 
@@ -206,28 +200,42 @@ io.on('connection', (socket) => {
   });
 });
 
-// Credit deduction: 1 credit = 1 minute
+// Credit deduction: Rial-based per minute
 setInterval(() => {
   const db = getDb();
+  const settings = Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map(r => [r.key, r.value]));
+  const pricePerHour = Number(settings.gaming_price_per_hour || 30000);
+  const peakStart = Number(settings.gaming_peak_start || 16);
+  const peakEnd = Number(settings.gaming_peak_end || 24);
+  const multiplier = (() => {
+    const h = new Date().getHours();
+    return (h >= peakStart && h < peakEnd) ? Number(settings.gaming_peak_multiplier || 1) : 1;
+  })();
+  const deductAmount = Math.ceil(pricePerHour * multiplier / 60);
+  const lowThreshold = pricePerHour; // warn when < 1 hour remaining
+
   connectedClients.forEach((client, socketId) => {
     if (client.status !== 'active' || !client.userId) return;
 
-    const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(client.userId);
+    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(client.userId);
     if (!user) return;
 
-    if (user.credits > 0) {
-      db.prepare('UPDATE users SET credits = credits - 1, total_minutes = total_minutes + 1 WHERE id = ?').run(client.userId);
-      db.prepare('UPDATE sessions SET duration = duration + 1 WHERE user_id = ? AND end_time IS NULL').run(client.userId);
-      client.credits = user.credits - 1;
-      io.to(socketId).emit('credits:update', { credits: client.credits });
+    if (user.credits >= deductAmount) {
+      db.prepare('UPDATE users SET credits = credits - ?, total_minutes = total_minutes + 1 WHERE id = ?')
+        .run(deductAmount, client.userId);
+      db.prepare('UPDATE sessions SET duration = duration + 1 WHERE user_id = ? AND end_time IS NULL')
+        .run(client.userId);
+      client.credits = user.credits - deductAmount;
+      io.to(socketId).emit('credits:update', { credits: client.credits, debt: user.debt });
 
-      if (client.credits <= 5) {
+      if (client.credits <= lowThreshold && client.credits > 0) {
         io.to(socketId).emit('credits:low', { credits: client.credits });
       }
 
       io.emit('clients:update', Array.from(connectedClients.values()));
     } else {
-      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(client.userId);
+      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL')
+        .run(client.userId);
       io.to(socketId).emit('session:end', { reason: 'no_credits' });
       client.status = 'idle';
       client.userId = null;
@@ -239,7 +247,6 @@ setInterval(() => {
   });
 }, 60000);
 
-// Serve admin panel static files if present
 const adminDistPath = process.env.ADMIN_DIST || require('path').join(__dirname, '..', 'admin', 'dist');
 const fs = require('fs');
 if (fs.existsSync(adminDistPath)) {

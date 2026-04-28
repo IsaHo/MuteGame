@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { formatRial } from '../api';
+import { api, formatRial } from '../api';
 
 export default function Settings({ addToast }) {
   const [settings, setSettings] = useState(null);
@@ -7,10 +7,7 @@ export default function Settings({ addToast }) {
   const [saved, setSaved] = useState(false);
 
   const load = async () => {
-    try {
-      const res = await fetch('/api/settings');
-      setSettings(await res.json());
-    } catch { }
+    try { setSettings(await api.getSettings()); } catch {}
   };
 
   useEffect(() => { load(); }, []);
@@ -18,11 +15,7 @@ export default function Settings({ addToast }) {
   const save = async () => {
     setLoading(true);
     try {
-      await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings),
-      });
+      await api.saveSettings(settings);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
       addToast('تنظیمات ذخیره شد ✅', 'success');
@@ -32,8 +25,8 @@ export default function Settings({ addToast }) {
 
   const set = (key, val) => setSettings(p => ({ ...p, [key]: val }));
 
-  const pricePerMin = Number(settings?.gaming_price_per_minute || 0);
-  const pricePerHour = pricePerMin * 60;
+  const pricePerHour = Number(settings?.gaming_price_per_hour || 30000);
+  const pricePerMin = pricePerHour / 60;
   const peakPrice = pricePerHour * Number(settings?.gaming_peak_multiplier || 1);
 
   if (!settings) return (
@@ -63,19 +56,23 @@ export default function Settings({ addToast }) {
               <span style={{ fontSize: 28 }}>🎮</span>
               <div>
                 <div style={{ fontWeight: 800, fontSize: 16 }}>قیمت‌گذاری ساعت بازی</div>
-                <div style={{ fontSize: 12, color: 'var(--text3)' }}>هزینه بازی به ازای هر دقیقه</div>
+                <div style={{ fontSize: 12, color: 'var(--text3)' }}>هزینه بازی به ازای هر ساعت (ریال)</div>
               </div>
             </div>
 
             <div className="form-group">
-              <label className="label">قیمت هر دقیقه (ریال)</label>
+              <label className="label">قیمت هر ساعت (ریال)</label>
               <input
                 type="number"
                 className="input"
-                value={settings.gaming_price_per_minute}
-                onChange={e => set('gaming_price_per_minute', e.target.value)}
+                value={settings.gaming_price_per_hour}
+                onChange={e => set('gaming_price_per_hour', e.target.value)}
                 min={0}
+                step={1000}
               />
+              <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 4 }}>
+                معادل: {Math.ceil(pricePerMin).toLocaleString('fa-IR')} ریال در دقیقه
+              </div>
             </div>
 
             {/* Preview */}
@@ -87,7 +84,7 @@ export default function Settings({ addToast }) {
               ].map(t => (
                 <div key={t.label} style={{ background: 'var(--bg2)', borderRadius: 10, padding: '10px', textAlign: 'center', border: '1px solid var(--border)' }}>
                   <div style={{ fontSize: 11, color: 'var(--text3)', marginBottom: 4 }}>{t.label}</div>
-                  <div style={{ fontWeight: 800, color: 'var(--purple3)', fontSize: 13 }}>{(pricePerMin * t.mins).toLocaleString('fa-IR')} ریال</div>
+                  <div style={{ fontWeight: 800, color: 'var(--purple3)', fontSize: 13 }}>{Math.ceil(pricePerMin * t.mins).toLocaleString('fa-IR')} ریال</div>
                 </div>
               ))}
             </div>
@@ -122,7 +119,6 @@ export default function Settings({ addToast }) {
               </div>
             </div>
 
-            {/* Peak preview */}
             <div style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)', borderRadius: 10, padding: '12px 16px' }}>
               <div style={{ fontSize: 12, color: 'var(--yellow)', marginBottom: 6 }}>⚡ ساعت شلوغ ({settings.gaming_peak_start}:00 تا {settings.gaming_peak_end}:00)</div>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
@@ -132,46 +128,85 @@ export default function Settings({ addToast }) {
             </div>
           </div>
 
-          {/* Cafe Info */}
-          <div className="card">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
-              <span style={{ fontSize: 28 }}>🏪</span>
-              <div>
-                <div style={{ fontWeight: 800, fontSize: 16 }}>اطلاعات گیم‌نت</div>
-                <div style={{ fontSize: 12, color: 'var(--text3)' }}>در گزارشات نمایش داده می‌شه</div>
+          {/* Right column */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+
+            {/* Cafe Info */}
+            <div className="card">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+                <span style={{ fontSize: 28 }}>🏪</span>
+                <div>
+                  <div style={{ fontWeight: 800, fontSize: 16 }}>اطلاعات گیم‌نت</div>
+                  <div style={{ fontSize: 12, color: 'var(--text3)' }}>در گزارشات نمایش داده می‌شه</div>
+                </div>
+              </div>
+              <div className="form-group">
+                <label className="label">نام گیم‌نت</label>
+                <input className="input" value={settings.cafe_name} onChange={e => set('cafe_name', e.target.value)} placeholder="MuteGame" />
+              </div>
+              <div className="form-group">
+                <label className="label">آدرس</label>
+                <input className="input" value={settings.cafe_address} onChange={e => set('cafe_address', e.target.value)} placeholder="آدرس گیم‌نت..." />
+              </div>
+              <div className="form-group">
+                <label className="label">شماره تلفن</label>
+                <input className="input" value={settings.cafe_phone} onChange={e => set('cafe_phone', e.target.value)} placeholder="021xxxxxxxx" dir="ltr" />
               </div>
             </div>
 
-            <div className="form-group">
-              <label className="label">نام گیم‌نت</label>
-              <input className="input" value={settings.cafe_name} onChange={e => set('cafe_name', e.target.value)} placeholder="MuteGame" />
-            </div>
-            <div className="form-group">
-              <label className="label">آدرس</label>
-              <input className="input" value={settings.cafe_address} onChange={e => set('cafe_address', e.target.value)} placeholder="آدرس گیم‌نت..." />
-            </div>
-            <div className="form-group">
-              <label className="label">شماره تلفن</label>
-              <input className="input" value={settings.cafe_phone} onChange={e => set('cafe_phone', e.target.value)} placeholder="021xxxxxxxx" dir="ltr" />
-            </div>
-
-            <div className="divider" />
-
-            {/* Summary card */}
-            <div style={{ background: 'linear-gradient(135deg, rgba(124,58,237,0.1), rgba(6,182,212,0.05))', border: '1px solid rgba(124,58,237,0.2)', borderRadius: 12, padding: 16 }}>
-              <div style={{ fontSize: 13, color: 'var(--text3)', marginBottom: 10 }}>خلاصه تعرفه</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {[
-                  { label: 'عادی - ۱ ساعت', val: pricePerHour, color: 'var(--green)' },
-                  { label: 'عادی - ۲ ساعت', val: pricePerHour * 2, color: 'var(--green)' },
-                  { label: 'شلوغ - ۱ ساعت', val: peakPrice, color: 'var(--yellow)' },
-                  { label: 'شلوغ - ۲ ساعت', val: peakPrice * 2, color: 'var(--yellow)' },
-                ].map(r => (
-                  <div key={r.label} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
-                    <span style={{ color: 'var(--text3)' }}>{r.label}</span>
-                    <span style={{ fontWeight: 700, color: r.color }}>{r.val.toLocaleString('fa-IR')} ریال</span>
+            {/* Tier Discounts */}
+            <div className="card">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+                <span style={{ fontSize: 28 }}>🏆</span>
+                <div>
+                  <div style={{ fontWeight: 800, fontSize: 16 }}>تخفیف رده‌بندی کاربران</div>
+                  <div style={{ fontSize: 12, color: 'var(--text3)' }}>بر اساس بیشترین زمان بازی</div>
+                </div>
+              </div>
+              {[
+                { key: 'tier1_discount', label: '🥇 رتبه اول', color: 'var(--yellow)' },
+                { key: 'tier2_discount', label: '🥈 رتبه دوم', color: 'var(--text2)' },
+                { key: 'tier3_discount', label: '🥉 رتبه سوم', color: '#cd7f32' },
+              ].map(t => (
+                <div key={t.key} className="form-group">
+                  <label className="label">{t.label}</label>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <input
+                      type="number" className="input" min={0} max={100} step={1}
+                      value={settings[t.key] || 0}
+                      onChange={e => set(t.key, e.target.value)}
+                      style={{ flex: 1 }}
+                    />
+                    <div style={{ padding: '10px 14px', background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 14, fontWeight: 800, color: t.color, whiteSpace: 'nowrap' }}>
+                      {settings[t.key] || 0}% تخفیف
+                    </div>
                   </div>
-                ))}
+                </div>
+              ))}
+              <div style={{ background: 'rgba(124,58,237,0.08)', border: '1px solid rgba(124,58,237,0.2)', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: 'var(--text3)' }}>
+                💡 تخفیف هنگام شارژ اعتبار اعمال می‌شه — اگه کاربر تخفیف فردی هم داشته باشه، بالاترین تخفیف اعمال می‌شه.
+              </div>
+            </div>
+
+            {/* Bad Payer Settings */}
+            <div className="card">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+                <span style={{ fontSize: 28 }}>⚠️</span>
+                <div>
+                  <div style={{ fontWeight: 800, fontSize: 16 }}>کاربران بد حساب</div>
+                  <div style={{ fontSize: 12, color: 'var(--text3)' }}>آستانه زمانی برای نمایش</div>
+                </div>
+              </div>
+              <div className="form-group">
+                <label className="label">نمایش کاربران با بدهی بیش از (روز)</label>
+                <input
+                  type="number" className="input" min={1} max={365}
+                  value={settings.bad_payer_days || 7}
+                  onChange={e => set('bad_payer_days', e.target.value)}
+                />
+                <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 4 }}>
+                  کاربری که بیش از {settings.bad_payer_days || 7} روز است بدهی داره نشون داده می‌شه
+                </div>
               </div>
             </div>
           </div>
