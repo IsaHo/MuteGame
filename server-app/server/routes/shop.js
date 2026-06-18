@@ -2,33 +2,56 @@ const express = require('express');
 const router = express.Router();
 const { getDb } = require('../database');
 
+// Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
+// (defense-in-depth). Both must pass for the route to run.
+function adminIpGuard(req, res, next) {
+  const auth = req.app.get('requireAdmin');
+  const ipGuard = req.app.get('requireAdminIp');
+  const chain = (mw, nextMw) => (req2, res2, nxt) =>
+    typeof mw === 'function' ? mw(req2, res2, () => nextMw(req2, res2, nxt)) : nextMw(req2, res2, nxt);
+  return chain(auth, ipGuard || ((_q, _s, n) => n()))(req, res, next);
+}
+
+function broadcastShopItems(req) {
+  const db = getDb();
+  const items = db.prepare("SELECT * FROM shop_items WHERE active = 1 ORDER BY category, name").all();
+  try { req.app.get('io')?.emit('shop:update', items); } catch {}
+}
+
 router.get('/items', (req, res) => {
   const db = getDb();
-  const items = db.prepare('SELECT * FROM shop_items ORDER BY category, name').all();
+  // Default: only active items (clients consume this). Pass ?all=1 from admin to see disabled ones.
+  const all = req.query.all === '1';
+  const items = db.prepare(`SELECT * FROM shop_items ${all ? '' : 'WHERE active = 1'} ORDER BY category, name`).all();
   res.json(items);
 });
 
-router.post('/items', (req, res) => {
+router.post('/items', adminIpGuard, (req, res) => {
   const { name, price, buy_price = 0, category, emoji, stock } = req.body;
   const db = getDb();
   const result = db.prepare(
     'INSERT INTO shop_items (name, price, buy_price, category, emoji, stock) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(name, price, buy_price, category || 'food', emoji || '🍔', stock ?? -1);
+  broadcastShopItems(req);
   res.json({ id: result.lastInsertRowid });
 });
 
-router.put('/items/:id', (req, res) => {
+router.put('/items/:id', adminIpGuard, (req, res) => {
   const { name, price, buy_price = 0, category, emoji, stock, active } = req.body;
   const db = getDb();
   db.prepare(
     'UPDATE shop_items SET name=?, price=?, buy_price=?, category=?, emoji=?, stock=?, active=? WHERE id=?'
   ).run(name, price, buy_price, category, emoji, stock, active ?? 1, req.params.id);
+  broadcastShopItems(req);
   res.json({ success: true });
 });
 
-router.delete('/items/:id', (req, res) => {
+router.delete('/items/:id', adminIpGuard, (req, res) => {
   const db = getDb();
+  // Soft-delete (preserves history for past orders) but the broadcast list
+  // filters active=1 so the client immediately sees it disappear.
   db.prepare('UPDATE shop_items SET active = 0 WHERE id = ?').run(req.params.id);
+  broadcastShopItems(req);
   res.json({ success: true });
 });
 
@@ -76,7 +99,7 @@ router.post('/orders', (req, res) => {
 });
 
 // Approve order — deduct stock and credits if needed
-router.post('/orders/:id/approve', (req, res) => {
+router.post('/orders/:id/approve', adminIpGuard, (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');
@@ -127,7 +150,7 @@ router.post('/orders/:id/approve', (req, res) => {
 });
 
 // Cancel order
-router.post('/orders/:id/cancel', (req, res) => {
+router.post('/orders/:id/cancel', adminIpGuard, (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');

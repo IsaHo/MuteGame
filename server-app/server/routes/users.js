@@ -3,7 +3,18 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { getDb } = require('../database');
 
-const SAFE_FIELDS = 'id, username, name, family, phone, is_active, credits, total_minutes, total_spent, debt, debt_since, discount_percent, created_at, last_login';
+// Lazy-load: middlewares are registered on app and we read them at request time.
+// Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
+// (defense-in-depth). Both must pass for the route to run.
+function adminIpGuard(req, res, next) {
+  const auth = req.app.get('requireAdmin');
+  const ipGuard = req.app.get('requireAdminIp');
+  const chain = (mw, nextMw) => (req2, res2, nxt) =>
+    typeof mw === 'function' ? mw(req2, res2, () => nextMw(req2, res2, nxt)) : nextMw(req2, res2, nxt);
+  return chain(auth, ipGuard || ((_q, _s, n) => n()))(req, res, next);
+}
+
+const SAFE_FIELDS = 'id, username, name, family, phone, is_active, credits, total_minutes, total_spent, debt, debt_since, discount_percent, limit_minutes, allowed_seats, post_pay, created_at, last_login';
 
 function nextUserNumber(db) {
   const row = db.prepare(`
@@ -80,16 +91,18 @@ router.get('/:id', (req, res) => {
   res.json(user);
 });
 
-router.post('/', (req, res) => {
-  const { name = '', family = '', phone = '', credits = 0 } = req.body;
+router.post('/', adminIpGuard, (req, res) => {
+  const { name = '', family = '', phone = '', credits = 0,
+          limit_minutes = 0, allowed_seats = 1, post_pay = 0 } = req.body;
   const db = getDb();
   try {
     const num = nextUserNumber(db);
     const username = String(num);
     const hash = bcrypt.hashSync(username, 10);
     const result = db.prepare(
-      'INSERT INTO users (username, password, name, family, phone, credits) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits);
+      'INSERT INTO users (username, password, name, family, phone, credits, limit_minutes, allowed_seats, post_pay) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits,
+          Number(limit_minutes) || 0, Math.max(1, Number(allowed_seats) || 1), post_pay ? 1 : 0);
 
     if (credits > 0) {
       db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
@@ -101,25 +114,31 @@ router.post('/', (req, res) => {
   }
 });
 
-router.put('/:id', (req, res) => {
-  const { name, family, phone, password, discount_percent } = req.body;
+router.put('/:id', adminIpGuard, (req, res) => {
+  const { name, family, phone, password, discount_percent,
+          limit_minutes, allowed_seats, post_pay } = req.body;
   const db = getDb();
   try {
-    if (password && password.trim()) {
-      const hash = bcrypt.hashSync(password, 10);
-      db.prepare('UPDATE users SET name=?, family=?, phone=?, password=?, discount_percent=? WHERE id=?')
-        .run(name || '', family || '', phone || '', hash, discount_percent ?? 0, req.params.id);
-    } else {
-      db.prepare('UPDATE users SET name=?, family=?, phone=?, discount_percent=? WHERE id=?')
-        .run(name || '', family || '', phone || '', discount_percent ?? 0, req.params.id);
-    }
+    const updates = [];
+    const params = [];
+    if (name !== undefined) { updates.push('name=?'); params.push(name || ''); }
+    if (family !== undefined) { updates.push('family=?'); params.push(family || ''); }
+    if (phone !== undefined) { updates.push('phone=?'); params.push(phone || ''); }
+    if (discount_percent !== undefined) { updates.push('discount_percent=?'); params.push(Number(discount_percent) || 0); }
+    if (limit_minutes !== undefined) { updates.push('limit_minutes=?'); params.push(Number(limit_minutes) || 0); }
+    if (allowed_seats !== undefined) { updates.push('allowed_seats=?'); params.push(Math.max(1, Number(allowed_seats) || 1)); }
+    if (post_pay !== undefined) { updates.push('post_pay=?'); params.push(post_pay ? 1 : 0); }
+    if (password && password.trim()) { updates.push('password=?'); params.push(bcrypt.hashSync(password, 10)); }
+    if (updates.length === 0) return res.json({ success: true });
+    params.push(req.params.id);
+    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/:id/toggle', (req, res) => {
+router.post('/:id/toggle', adminIpGuard, (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');
@@ -141,16 +160,31 @@ router.post('/:id/toggle', (req, res) => {
   res.json({ is_active: newStatus });
 });
 
-router.delete('/:id', (req, res) => {
+router.delete('/:id', adminIpGuard, (req, res) => {
   const db = getDb();
   db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
 // Charge (add credits) with tier/individual discount
-router.post('/:id/charge', (req, res) => {
-  const { amount, description } = req.body;
+router.post('/:id/charge', adminIpGuard, (req, res) => {
+  const { amount, description, free = false } = req.body;
   const db = getDb();
+
+  // Free charge: skip discount logic (it's already a gift) and don't bump
+  // total_spent (which feeds tier rankings) — also tag the txn type so it
+  // doesn't pollute revenue reports.
+  if (free) {
+    const amt = Number(amount);
+    const desc = description || '🎁 شارژ رایگان (هدیه ادمین)';
+    db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(amt, req.params.id);
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(req.params.id, amt, 'free_gift', desc);
+    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    syncClientCredits(req, req.params.id, user.credits, user.debt);
+    return res.json({ credits: user.credits, bonus: 0, discount: 0, free: true });
+  }
+
   const { total, bonus, discount } = applyDiscount(db, req.params.id, Number(amount));
 
   const desc = description || (bonus > 0
@@ -168,7 +202,7 @@ router.post('/:id/charge', (req, res) => {
 });
 
 // Decharge (remove credits)
-router.post('/:id/decharge', (req, res) => {
+router.post('/:id/decharge', adminIpGuard, (req, res) => {
   const { amount, description = 'کاهش شارژ توسط ادمین' } = req.body;
   const db = getDb();
   db.prepare('UPDATE users SET credits = MAX(0, credits - ?) WHERE id = ?').run(Number(amount), req.params.id);
@@ -181,7 +215,7 @@ router.post('/:id/decharge', (req, res) => {
 });
 
 // Add debt
-router.post('/:id/debt/add', (req, res) => {
+router.post('/:id/debt/add', adminIpGuard, (req, res) => {
   const { amount, description = 'افزایش بدهی' } = req.body;
   const db = getDb();
   const current = db.prepare('SELECT debt FROM users WHERE id = ?').get(req.params.id);
@@ -198,7 +232,7 @@ router.post('/:id/debt/add', (req, res) => {
 });
 
 // Pay debt
-router.post('/:id/debt/pay', (req, res) => {
+router.post('/:id/debt/pay', adminIpGuard, (req, res) => {
   const { amount, description = 'پرداخت بدهی' } = req.body;
   const db = getDb();
   db.prepare('UPDATE users SET debt = MAX(0, debt - ?) WHERE id = ?').run(Number(amount), req.params.id);

@@ -3,7 +3,18 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { getDb } = require('../database');
 
-const SAFE_FIELDS = 'id, username, name, family, phone, is_active, credits, total_minutes, total_spent, debt, debt_since, discount_percent, created_at, last_login';
+// Lazy-load: middlewares are registered on app and we read them at request time.
+// Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
+// (defense-in-depth). Both must pass for the route to run.
+function adminIpGuard(req, res, next) {
+  const auth = req.app.get('requireAdmin');
+  const ipGuard = req.app.get('requireAdminIp');
+  const chain = (mw, nextMw) => (req2, res2, nxt) =>
+    typeof mw === 'function' ? mw(req2, res2, () => nextMw(req2, res2, nxt)) : nextMw(req2, res2, nxt);
+  return chain(auth, ipGuard || ((_q, _s, n) => n()))(req, res, next);
+}
+
+const SAFE_FIELDS = 'id, username, name, family, phone, is_active, credits, total_minutes, total_spent, debt, debt_since, discount_percent, limit_minutes, allowed_seats, post_pay, limit_time, created_at, last_login';
 
 function nextUserNumber(db) {
   const row = db.prepare(`
@@ -35,23 +46,38 @@ function applyDiscount(db, userId, amount) {
 function notifyClient(req, userId, event, data) {
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');
+  let touched = false;
   connectedClients.forEach((client, socketId) => {
     if (client.userId == userId) {
+      // Mirror the new credits/debt onto the cached client struct so admin's
+      // PC list reflects the change without a second HTTP round-trip.
+      if (data && typeof data.credits === 'number') client.credits = data.credits;
+      if (data && typeof data.debt    === 'number') client.debt    = data.debt;
       io.to(socketId).emit(event, data);
+      touched = true;
     }
   });
+  if (touched) io.emit('clients:update', Array.from(connectedClients.values()));
 }
 
 function syncClientCredits(req, userId, credits, debt) {
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');
+  // Look up post_pay too — if admin just toggled it, the cached client.postPay
+  // would be stale otherwise. One DB read per sync is cheap.
+  const db = getDb();
+  const u = db.prepare('SELECT post_pay FROM users WHERE id = ?').get(userId) || {};
+  let touched = false;
   connectedClients.forEach((client, socketId) => {
     if (client.userId == userId) {
       client.credits = credits;
-      io.to(socketId).emit('credits:update', { credits, debt });
-      io.emit('clients:update', Array.from(connectedClients.values()));
+      client.debt    = debt;
+      client.postPay = u.post_pay ? 1 : 0;
+      io.to(socketId).emit('credits:update', { credits, debt, postPay: client.postPay });
+      touched = true;
     }
   });
+  if (touched) io.emit('clients:update', Array.from(connectedClients.values()));
 }
 
 router.get('/', (req, res) => {
@@ -73,6 +99,38 @@ router.get('/bad-payers', (req, res) => {
   res.json(users);
 });
 
+// All users with any outstanding debt — feeds AccountingPage's debts tab
+// and ReportsPage's top-debtors widget. Includes debt_since so the UI can
+// flag stale debts (visually highlights ones older than bad_payer_days).
+router.get('/debts', (_req, res) => {
+  const db = getDb();
+  const users = db.prepare(`
+    SELECT ${SAFE_FIELDS} FROM users
+    WHERE debt > 0
+    ORDER BY debt DESC
+  `).all();
+  res.json(users);
+});
+
+// Debt-only ledger across all users for the last N days. Used by Accounting
+// to show "recent debt activity" (additions vs payments) and by Reports
+// to compute the daily debt-flow chart.
+router.get('/debt-transactions', (req, res) => {
+  const db = getDb();
+  const days = Math.max(1, Number(req.query.days) || 30);
+  const rows = db.prepare(`
+    SELECT t.id, t.user_id, t.amount, t.type, t.description, t.created_at,
+           u.username, u.name, u.family
+    FROM credit_transactions t
+    LEFT JOIN users u ON u.id = t.user_id
+    WHERE t.type IN ('debt_add', 'debt_pay')
+      AND t.created_at >= datetime('now', 'localtime', '-${days} days')
+    ORDER BY t.created_at DESC
+    LIMIT 500
+  `).all();
+  res.json(rows);
+});
+
 router.get('/:id', (req, res) => {
   const db = getDb();
   const user = db.prepare(`SELECT ${SAFE_FIELDS} FROM users WHERE id = ?`).get(req.params.id);
@@ -80,16 +138,19 @@ router.get('/:id', (req, res) => {
   res.json(user);
 });
 
-router.post('/', (req, res) => {
-  const { name = '', family = '', phone = '', credits = 0 } = req.body;
+router.post('/', adminIpGuard, (req, res) => {
+  const { name = '', family = '', phone = '', credits = 0,
+          limit_minutes = 0, allowed_seats = 1, post_pay = 0, limit_time = 0 } = req.body;
   const db = getDb();
   try {
     const num = nextUserNumber(db);
     const username = String(num);
     const hash = bcrypt.hashSync(username, 10);
     const result = db.prepare(
-      'INSERT INTO users (username, password, name, family, phone, credits) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits);
+      'INSERT INTO users (username, password, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits,
+          Number(limit_minutes) || 0, Math.max(1, Number(allowed_seats) || 1),
+          post_pay ? 1 : 0, limit_time ? 1 : 0);
 
     if (credits > 0) {
       db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
@@ -101,25 +162,32 @@ router.post('/', (req, res) => {
   }
 });
 
-router.put('/:id', (req, res) => {
-  const { name, family, phone, password, discount_percent } = req.body;
+router.put('/:id', adminIpGuard, (req, res) => {
+  const { name, family, phone, password, discount_percent,
+          limit_minutes, allowed_seats, post_pay, limit_time } = req.body;
   const db = getDb();
   try {
-    if (password && password.trim()) {
-      const hash = bcrypt.hashSync(password, 10);
-      db.prepare('UPDATE users SET name=?, family=?, phone=?, password=?, discount_percent=? WHERE id=?')
-        .run(name || '', family || '', phone || '', hash, discount_percent ?? 0, req.params.id);
-    } else {
-      db.prepare('UPDATE users SET name=?, family=?, phone=?, discount_percent=? WHERE id=?')
-        .run(name || '', family || '', phone || '', discount_percent ?? 0, req.params.id);
-    }
+    const updates = [];
+    const params = [];
+    if (name !== undefined) { updates.push('name=?'); params.push(name || ''); }
+    if (family !== undefined) { updates.push('family=?'); params.push(family || ''); }
+    if (phone !== undefined) { updates.push('phone=?'); params.push(phone || ''); }
+    if (discount_percent !== undefined) { updates.push('discount_percent=?'); params.push(Number(discount_percent) || 0); }
+    if (limit_minutes !== undefined) { updates.push('limit_minutes=?'); params.push(Number(limit_minutes) || 0); }
+    if (allowed_seats !== undefined) { updates.push('allowed_seats=?'); params.push(Math.max(1, Number(allowed_seats) || 1)); }
+    if (post_pay !== undefined) { updates.push('post_pay=?'); params.push(post_pay ? 1 : 0); }
+    if (limit_time !== undefined) { updates.push('limit_time=?'); params.push(limit_time ? 1 : 0); }
+    if (password && password.trim()) { updates.push('password=?'); params.push(bcrypt.hashSync(password, 10)); }
+    if (updates.length === 0) return res.json({ success: true });
+    params.push(req.params.id);
+    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/:id/toggle', (req, res) => {
+router.post('/:id/toggle', adminIpGuard, (req, res) => {
   const db = getDb();
   const io = req.app.get('io');
   const connectedClients = req.app.get('connectedClients');
@@ -141,16 +209,49 @@ router.post('/:id/toggle', (req, res) => {
   res.json({ is_active: newStatus });
 });
 
-router.delete('/:id', (req, res) => {
+router.delete('/:id', adminIpGuard, (req, res) => {
   const db = getDb();
   db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
-// Charge (add credits) with tier/individual discount
-router.post('/:id/charge', (req, res) => {
-  const { amount, description } = req.body;
+// Quick post-pay toggle from the ComputersPage. POST body may carry an
+// explicit { post_pay: 0|1 } to set, otherwise we flip the current value.
+// On success the matching connected client(s) get a credits:update with the
+// fresh post_pay flag and clients:update is broadcast to admin views.
+router.post('/:id/post-pay', adminIpGuard, (req, res) => {
   const db = getDb();
+  const user = db.prepare('SELECT post_pay, credits, debt FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
+  const next = (req.body && req.body.post_pay !== undefined)
+    ? (req.body.post_pay ? 1 : 0)
+    : (user.post_pay ? 0 : 1);
+  db.prepare('UPDATE users SET post_pay = ? WHERE id = ?').run(next, req.params.id);
+  // Push the updated state to any connected client + every admin view.
+  const fresh = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  syncClientCredits(req, req.params.id, fresh.credits, fresh.debt);
+  res.json({ post_pay: next, credits: fresh.credits, debt: fresh.debt });
+});
+
+// Charge (add credits) with tier/individual discount
+router.post('/:id/charge', adminIpGuard, (req, res) => {
+  const { amount, description, free = false } = req.body;
+  const db = getDb();
+
+  // Free charge: skip discount logic (it's already a gift) and don't bump
+  // total_spent (which feeds tier rankings) — also tag the txn type so it
+  // doesn't pollute revenue reports.
+  if (free) {
+    const amt = Number(amount);
+    const desc = description || '🎁 شارژ رایگان (هدیه ادمین)';
+    db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(amt, req.params.id);
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(req.params.id, amt, 'free_gift', desc);
+    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    syncClientCredits(req, req.params.id, user.credits, user.debt);
+    return res.json({ credits: user.credits, bonus: 0, discount: 0, free: true });
+  }
+
   const { total, bonus, discount } = applyDiscount(db, req.params.id, Number(amount));
 
   const desc = description || (bonus > 0
@@ -168,7 +269,7 @@ router.post('/:id/charge', (req, res) => {
 });
 
 // Decharge (remove credits)
-router.post('/:id/decharge', (req, res) => {
+router.post('/:id/decharge', adminIpGuard, (req, res) => {
   const { amount, description = 'کاهش شارژ توسط ادمین' } = req.body;
   const db = getDb();
   db.prepare('UPDATE users SET credits = MAX(0, credits - ?) WHERE id = ?').run(Number(amount), req.params.id);
@@ -181,7 +282,7 @@ router.post('/:id/decharge', (req, res) => {
 });
 
 // Add debt
-router.post('/:id/debt/add', (req, res) => {
+router.post('/:id/debt/add', adminIpGuard, (req, res) => {
   const { amount, description = 'افزایش بدهی' } = req.body;
   const db = getDb();
   const current = db.prepare('SELECT debt FROM users WHERE id = ?').get(req.params.id);
@@ -198,7 +299,7 @@ router.post('/:id/debt/add', (req, res) => {
 });
 
 // Pay debt
-router.post('/:id/debt/pay', (req, res) => {
+router.post('/:id/debt/pay', adminIpGuard, (req, res) => {
   const { amount, description = 'پرداخت بدهی' } = req.body;
   const db = getDb();
   db.prepare('UPDATE users SET debt = MAX(0, debt - ?) WHERE id = ?').run(Number(amount), req.params.id);
