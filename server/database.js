@@ -389,15 +389,135 @@ function initDatabase() {
     console.log('✅ Default DNS list seeded (' + dnsList.length + ')');
   }
 
-  // Close any orphan sessions left open by a previous (crashed/killed) server run.
-  // Without this, those rows have no end_time and the dashboard keeps showing
-  // them as "in progress" indefinitely after the user has logged out.
+  // ─── Billing migration prep (Phase 1) ────────────────────────────────
+  // Idempotent data fix that establishes the pre-conditions for the
+  // billing v2 schema in Phase 2:
+  //   • every orphan session is closed (end_time set) with end_reason
+  //     'pre_migration' — Phase 2's UNIQUE INDEX
+  //     idx_one_open_session_per_seat would otherwise fail to create.
+  //   • users.credits floored at 0; overflow moved to debt — Phase 2 adds
+  //     CHECK (credits >= 0) which would otherwise reject the entire
+  //     migration.
+  //   • users.debt floored at 0 — same CHECK rationale.
+  //   • every balance move records a credit_transactions row so the
+  //     ledger captures the absorption (it'll be carried into
+  //     credit_ledger by Phase 2's import).
+  // Idempotent: the WHERE clauses are empty on second run, so re-execution
+  // is a no-op. Safe to run on every boot.
   try {
-    const orphan = db.prepare("UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE end_time IS NULL").run();
-    if (orphan.changes > 0) console.log(`🧹 Closed ${orphan.changes} orphan session(s) from previous run`);
-  } catch (e) { console.error('orphan-cleanup:', e.message); }
+    prepBillingMigration(db);
+  } catch (e) { console.error('billing-prep:', e.stack || e.message); throw e; }
 
   console.log('✅ Database ready');
 }
 
-module.exports = { initDatabase, getDb };
+/*
+ * Phase 1 idempotent billing data fix. Public for testability. Returns a
+ * structured report so callers (boot, tests, operator dry-runs) can verify
+ * exact rows affected without re-querying the DB.
+ *
+ * Idempotency: every WHERE clause is empty on subsequent runs because the
+ * fix flips the matching predicate to false. Running this on every boot is
+ * intentional — a cheap consistency probe.
+ *
+ * Schema changes here are conservative: only an additive nullable
+ * `end_reason TEXT` column on sessions. No data is lost; no existing query
+ * breaks. The big schema restructure (CHECK constraints on users, new
+ * tables, partial UNIQUE INDEX) lands in Phase 2.
+ */
+function prepBillingMigration(db) {
+  const report = {
+    started_at: new Date().toISOString(),
+    schema_changes: [],
+    sessions_closed: 0,
+    sessions_closed_ids: [],
+    users_credits_floored: 0,
+    users_credits_floored_details: [],
+    users_debt_floored: 0,
+    users_debt_floored_details: [],
+    ledger_writes: 0,
+  };
+
+  // (a) Add nullable end_reason column if missing. Idempotent via PRAGMA.
+  const sessionCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+  if (!sessionCols.includes('end_reason')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN end_reason TEXT');
+    report.schema_changes.push('sessions.end_reason TEXT (added)');
+  }
+
+  // (b) Close orphan sessions. COALESCE(start_time, CURRENT_TIMESTAMP):
+  // start_time is the conservative choice when last_billed_at doesn't
+  // exist yet; duration was already accumulated by the per-minute ticker.
+  const orphans = db.prepare('SELECT id FROM sessions WHERE end_time IS NULL').all();
+  if (orphans.length > 0) {
+    const closeStmt = db.prepare(
+      "UPDATE sessions SET end_time = COALESCE(start_time, CURRENT_TIMESTAMP), " +
+      "end_reason = COALESCE(end_reason, 'pre_migration') " +
+      'WHERE id = ? AND end_time IS NULL'
+    );
+    for (const o of orphans) {
+      closeStmt.run(o.id);
+      report.sessions_closed_ids.push(o.id);
+    }
+    report.sessions_closed = orphans.length;
+  }
+
+  // (c) Floor negative credits → debt. Each user fixed in its own
+  // transaction so the UPDATE and the ledger INSERT commit together.
+  const negCredit = db.prepare('SELECT id, username, credits, debt FROM users WHERE credits < 0').all();
+  for (const u of negCredit) {
+    const delta = -u.credits;
+    db.transaction(() => {
+      const r = db.prepare(
+        'UPDATE users SET credits = 0, debt = debt + ? WHERE id = ? AND credits < 0'
+      ).run(delta, u.id);
+      if (r.changes !== 1) {
+        throw new Error('prepBillingMigration: negCredit UPDATE matched ' + r.changes + ' rows for user ' + u.id);
+      }
+      db.prepare(
+        'INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)'
+      ).run(u.id, delta, 'debt_add', 'pre_migration: negative credits absorbed to debt (delta=' + delta + ')');
+      report.ledger_writes += 1;
+    })();
+    report.users_credits_floored_details.push({ user_id: u.id, username: u.username, credits_before: u.credits, debt_before: u.debt, debt_after: u.debt + delta, delta });
+  }
+  report.users_credits_floored = negCredit.length;
+
+  // (d) Floor negative debt → 0. Records a 0-amount debt_pay marker so the
+  // ledger explains the flip.
+  const negDebt = db.prepare('SELECT id, username, debt FROM users WHERE debt < 0').all();
+  for (const u of negDebt) {
+    const original = u.debt;
+    db.transaction(() => {
+      const r = db.prepare('UPDATE users SET debt = 0 WHERE id = ? AND debt < 0').run(u.id);
+      if (r.changes !== 1) {
+        throw new Error('prepBillingMigration: negDebt UPDATE matched ' + r.changes + ' rows for user ' + u.id);
+      }
+      db.prepare(
+        'INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)'
+      ).run(u.id, 0, 'debt_pay', 'pre_migration: negative debt floored to zero (was=' + original + ')');
+      report.ledger_writes += 1;
+    })();
+    report.users_debt_floored_details.push({ user_id: u.id, username: u.username, original_debt: original });
+  }
+  report.users_debt_floored = negDebt.length;
+
+  report.completed_at = new Date().toISOString();
+
+  const touched = report.sessions_closed + report.users_credits_floored + report.users_debt_floored + report.schema_changes.length;
+  if (touched > 0) {
+    console.log('🧹 [billing-prep] applied — ' + JSON.stringify({
+      sessions_closed: report.sessions_closed,
+      users_credits_floored: report.users_credits_floored,
+      users_debt_floored: report.users_debt_floored,
+      ledger_writes: report.ledger_writes,
+      schema_changes: report.schema_changes,
+    }));
+  } else {
+    console.log('🧹 [billing-prep] no-op (idempotent: all invariants already satisfied)');
+  }
+
+  return report;
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration };
