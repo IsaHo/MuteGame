@@ -59,11 +59,14 @@ router.post('/', requireAdmin('games.edit'), (req, res) => {
   if (!name || !exe_name) return res.status(400).json({ error: 'نام و exe_name الزامی است' });
   if (!EXE_NAME_RE.test(exe_name)) return res.status(400).json({ error: 'exe_name نامعتبر است (فقط نام فایل با پسوند .exe/.bat/.cmd/.lnk)' });
   const db = getDb();
-  const info = db.prepare(
-    `INSERT INTO games (name, exe_name, category, sort_order, hint_path, is_launcher) VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(name, exe_name, category, sort_order, hint_path, is_launcher ? 1 : 0);
-  audit(req, 'game.create', 'game', info.lastInsertRowid, { name, exe_name, is_launcher });
-  const game = db.prepare('SELECT * FROM games WHERE id = ?').get(info.lastInsertRowid);
+  let game;
+  db.transaction(() => {
+    const info = db.prepare(
+      `INSERT INTO games (name, exe_name, category, sort_order, hint_path, is_launcher) VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(name, exe_name, category, sort_order, hint_path, is_launcher ? 1 : 0);
+    audit(req, 'game.create', 'game', info.lastInsertRowid, { name, exe_name, is_launcher });
+    game = db.prepare('SELECT * FROM games WHERE id = ?').get(info.lastInsertRowid);
+  })();
   req.app.get('io').emit('games:update', db.prepare('SELECT * FROM games WHERE active = 1 ORDER BY sort_order, name').all());
   res.json(game);
 });
@@ -77,20 +80,23 @@ router.put('/:id', requireAdmin('games.edit'), (req, res) => {
   const db = getDb();
   const exists = db.prepare('SELECT id FROM games WHERE id = ?').get(req.params.id);
   if (!exists) return res.status(404).json({ error: 'بازی پیدا نشد' });
-  db.prepare(
-    `UPDATE games SET name = COALESCE(?, name),
-                      exe_name = COALESCE(?, exe_name),
-                      category = COALESCE(?, category),
-                      sort_order = COALESCE(?, sort_order),
-                      hint_path = COALESCE(?, hint_path),
-                      active = COALESCE(?, active),
-                      is_launcher = COALESCE(?, is_launcher)
-     WHERE id = ?`
-  ).run(name, exe_name, category, sort_order, hint_path, active,
-        is_launcher === undefined ? null : (is_launcher ? 1 : 0),
-        req.params.id);
-  audit(req, 'game.update', 'game', req.params.id, req.body);
-  const game = db.prepare('SELECT * FROM games WHERE id = ?').get(req.params.id);
+  let game;
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE games SET name = COALESCE(?, name),
+                        exe_name = COALESCE(?, exe_name),
+                        category = COALESCE(?, category),
+                        sort_order = COALESCE(?, sort_order),
+                        hint_path = COALESCE(?, hint_path),
+                        active = COALESCE(?, active),
+                        is_launcher = COALESCE(?, is_launcher)
+       WHERE id = ?`
+    ).run(name, exe_name, category, sort_order, hint_path, active,
+          is_launcher === undefined ? null : (is_launcher ? 1 : 0),
+          req.params.id);
+    audit(req, 'game.update', 'game', req.params.id, req.body);
+    game = db.prepare('SELECT * FROM games WHERE id = ?').get(req.params.id);
+  })();
   req.app.get('io').emit('games:update', db.prepare('SELECT * FROM games WHERE active = 1 ORDER BY sort_order, name').all());
   res.json(game);
 });
@@ -103,8 +109,10 @@ router.delete('/:id', requireAdmin('games.edit'), (req, res) => {
   if (game.image_path) {
     try { fs.unlinkSync(path.join(IMAGE_DIR, game.image_path)); } catch {}
   }
-  db.prepare('DELETE FROM games WHERE id = ?').run(req.params.id);
-  audit(req, 'game.delete', 'game', req.params.id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM games WHERE id = ?').run(req.params.id);
+    audit(req, 'game.delete', 'game', req.params.id);
+  })();
   req.app.get('io').emit('games:update', db.prepare('SELECT * FROM games WHERE active = 1 ORDER BY sort_order, name').all());
   res.json({ success: true });
 });
@@ -121,9 +129,12 @@ router.post('/:id/image', requireAdmin('games.edit'), upload.single('image'), (r
   if (old.image_path) {
     try { fs.unlinkSync(path.join(IMAGE_DIR, old.image_path)); } catch {}
   }
-  db.prepare('UPDATE games SET image_path = ? WHERE id = ?').run(req.file.filename, req.params.id);
-  audit(req, 'game.image', 'game', req.params.id, { filename: req.file.filename });
-  const game = db.prepare('SELECT * FROM games WHERE id = ?').get(req.params.id);
+  let game;
+  db.transaction(() => {
+    db.prepare('UPDATE games SET image_path = ? WHERE id = ?').run(req.file.filename, req.params.id);
+    audit(req, 'game.image', 'game', req.params.id, { filename: req.file.filename });
+    game = db.prepare('SELECT * FROM games WHERE id = ?').get(req.params.id);
+  })();
   req.app.get('io').emit('games:update', db.prepare('SELECT * FROM games WHERE active = 1 ORDER BY sort_order, name').all());
   res.json(game);
 });

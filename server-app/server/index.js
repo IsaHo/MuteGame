@@ -492,6 +492,16 @@ setInterval(() => {
   });
 }, 60000);
 
+// Global error middleware — must be LAST. A thrown handler (e.g. an audit
+// INSERT that rolled back the surrounding `db.transaction`) lands here and
+// is surfaced as a JSON 500 so the admin SPA can render a real message
+// rather than an HTML stack trace.
+app.use((err, _req, res, _next) => {
+  console.error('[express]', err && (err.stack || err.message || err));
+  if (res.headersSent) return;
+  res.status(500).json({ error: (err && err.message) || 'خطای داخلی سرور' });
+});
+
 const adminDistPath = process.env.ADMIN_DIST || require('path').join(__dirname, '..', 'admin', 'dist');
 const fs = require('fs');
 if (fs.existsSync(adminDistPath)) {

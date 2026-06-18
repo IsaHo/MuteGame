@@ -540,6 +540,18 @@ if (fs.existsSync(adminDistPath)) {
   app.get('/admin/*', (req, res) => res.sendFile(require('path').join(adminDistPath, 'index.html')));
 }
 
+// Global error middleware — must be LAST. A thrown handler (e.g. an audit
+// INSERT that rolled back the surrounding `db.transaction`) lands here and
+// is surfaced as a JSON 500 so the admin SPA can render a real message
+// rather than an HTML stack trace. Audit failures used to be silently
+// swallowed; with the new throw-instead-of-swallow semantics they now
+// reach this handler and become visible.
+app.use((err, _req, res, _next) => {
+  console.error('[express]', err && (err.stack || err.message || err));
+  if (res.headersSent) return;
+  res.status(500).json({ error: (err && err.message) || 'خطای داخلی سرور' });
+});
+
 function startServer(port) {
   const PORT = port || process.env.PORT || 3001;
   server.listen(PORT, '0.0.0.0', () => {

@@ -50,20 +50,21 @@ function requireAdmin(perm) {
   };
 }
 
-/* Write an audit entry. Pass action like 'user.charge', entity 'user', entity_id user.id, details obj */
+/*
+ * Append one audit row. Throws on DB failure — callers MUST run this inside
+ * a `db.transaction(...)` that also performs the state change. If the audit
+ * insert fails, the throw rolls back the surrounding transaction so the
+ * state change is undone too.
+ */
 function audit(req, action, entity, entityId, details) {
-  try {
-    const db = getDb();
-    const adminUsername = req.admin?.username || (req.body && req.body.username) || '-';
-    const adminId = req.admin?.id || null;
-    const adminIp = normalizeIp(req.ip);
-    const detailsStr = details ? (typeof details === 'string' ? details : JSON.stringify(details)) : '';
-    db.prepare(`INSERT INTO audit_log (admin_id, admin_username, admin_ip, action, entity, entity_id, details)
-                VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(adminId, adminUsername, adminIp, action, entity || '', entityId ? String(entityId) : '', detailsStr);
-  } catch (e) {
-    console.error('audit failed:', e.message);
-  }
+  const db = getDb();
+  const adminUsername = req.admin?.username || (req.body && req.body.username) || '-';
+  const adminId = req.admin?.id || null;
+  const adminIp = normalizeIp(req.ip);
+  const detailsStr = details ? (typeof details === 'string' ? details : JSON.stringify(details)) : '';
+  db.prepare(`INSERT INTO audit_log (admin_id, admin_username, admin_ip, action, entity, entity_id, details)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(adminId, adminUsername, adminIp, action, entity || '', entityId ? String(entityId) : '', detailsStr);
 }
 
 module.exports = { attachAdmin, requireAdmin, audit, normalizeIp, PERMS };
