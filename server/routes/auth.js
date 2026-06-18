@@ -3,6 +3,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { getDb } = require('../database');
+const { audit } = require('../audit');
 
 const JWT_SECRET = require('../jwt-secret');
 
@@ -21,9 +22,15 @@ router.post('/admin/login', (req, res) => {
   // First successful admin login pins admin_ip; can be cleared from admin panel.
   const reqIp = normalizeIp(req.ip);
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'admin_ip'").get()?.value;
-  if (!existing && reqIp) {
-    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('admin_ip', ?, CURRENT_TIMESTAMP)").run(reqIp);
-  }
+  // Set req.admin so the audit row records the authenticated id/username
+  // instead of falling back to req.body.username (spoofable).
+  req.admin = { id: admin.id, username: admin.username, role: admin.role };
+  db.transaction(() => {
+    if (!existing && reqIp) {
+      db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('admin_ip', ?, CURRENT_TIMESTAMP)").run(reqIp);
+    }
+    audit(req, 'auth.admin.login', 'admin', admin.id, { ip: reqIp, pinned_ip: !existing });
+  })();
   const token = jwt.sign({ id: admin.id, role: 'admin' }, JWT_SECRET, { expiresIn: '24h' });
   res.json({ token, username: admin.username, adminIp: existing || reqIp });
 });
@@ -36,7 +43,11 @@ router.post('/admin/reset-admin-ip', (req, res) => {
     return res.status(401).json({ error: 'نام کاربری یا رمز عبور اشتباه است' });
   }
   const reqIp = normalizeIp(req.ip);
-  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('admin_ip', ?, CURRENT_TIMESTAMP)").run(reqIp);
+  req.admin = { id: admin.id, username: admin.username, role: admin.role };
+  db.transaction(() => {
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('admin_ip', ?, CURRENT_TIMESTAMP)").run(reqIp);
+    audit(req, 'auth.admin-ip.reset', 'settings', null, { new_ip: reqIp });
+  })();
   res.json({ success: true, adminIp: reqIp });
 });
 

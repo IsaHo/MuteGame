@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../database');
+const { audit } = require('../audit');
 
 // Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
 // (defense-in-depth). Both must pass for the route to run.
@@ -27,6 +28,7 @@ router.post('/', adminIpGuard, (req, res) => {
   const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)');
   const update = db.transaction((obj) => {
     for (const [k, v] of Object.entries(obj)) upsert.run(k, String(v));
+    audit(req, 'settings.update', 'settings', null, { keys: Object.keys(obj) });
   });
   update(req.body);
   const all = getAllSettings(db);

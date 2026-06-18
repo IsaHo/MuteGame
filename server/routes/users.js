@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { getDb } = require('../database');
+const { audit } = require('../audit');
 
 // Lazy-load: middlewares are registered on app and we read them at request time.
 // Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
@@ -143,19 +144,22 @@ router.post('/', adminIpGuard, (req, res) => {
           limit_minutes = 0, allowed_seats = 1, post_pay = 0, limit_time = 0 } = req.body;
   const db = getDb();
   try {
-    const num = nextUserNumber(db);
-    const username = String(num);
-    const hash = bcrypt.hashSync(username, 10);
-    const result = db.prepare(
-      'INSERT INTO users (username, password, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits,
-          Number(limit_minutes) || 0, Math.max(1, Number(allowed_seats) || 1),
-          post_pay ? 1 : 0, limit_time ? 1 : 0);
-
-    if (credits > 0) {
-      db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-        .run(result.lastInsertRowid, credits, 'charge', 'شارژ اولیه');
-    }
+    let username, result;
+    db.transaction(() => {
+      const num = nextUserNumber(db);
+      username = String(num);
+      const hash = bcrypt.hashSync(username, 10);
+      result = db.prepare(
+        'INSERT INTO users (username, password, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits,
+            Number(limit_minutes) || 0, Math.max(1, Number(allowed_seats) || 1),
+            post_pay ? 1 : 0, limit_time ? 1 : 0);
+      if (credits > 0) {
+        db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+          .run(result.lastInsertRowid, credits, 'charge', 'شارژ اولیه');
+      }
+      audit(req, 'user.create', 'user', result.lastInsertRowid, { username, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time });
+    })();
     res.json({ id: result.lastInsertRowid, username, name, family, phone, credits });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -180,7 +184,10 @@ router.put('/:id', adminIpGuard, (req, res) => {
     if (password && password.trim()) { updates.push('password=?'); params.push(bcrypt.hashSync(password, 10)); }
     if (updates.length === 0) return res.json({ success: true });
     params.push(req.params.id);
-    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    db.transaction(() => {
+      db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+      audit(req, 'user.update', 'user', req.params.id, { fields: updates.map(u => u.split('=')[0]) });
+    })();
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -196,7 +203,10 @@ router.post('/:id/toggle', adminIpGuard, (req, res) => {
   if (!user) return res.status(404).json({ error: 'کاربر پیدا نشد' });
 
   const newStatus = user.is_active ? 0 : 1;
-  db.prepare('UPDATE users SET is_active = ? WHERE id = ?').run(newStatus, req.params.id);
+  db.transaction(() => {
+    db.prepare('UPDATE users SET is_active = ? WHERE id = ?').run(newStatus, req.params.id);
+    audit(req, 'user.toggle-active', 'user', req.params.id, { is_active: newStatus });
+  })();
 
   if (!newStatus) {
     connectedClients.forEach((client, socketId) => {
@@ -211,7 +221,11 @@ router.post('/:id/toggle', adminIpGuard, (req, res) => {
 
 router.delete('/:id', adminIpGuard, (req, res) => {
   const db = getDb();
-  db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+  const target = db.prepare('SELECT username FROM users WHERE id = ?').get(req.params.id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM users WHERE id = ?').run(req.params.id);
+    audit(req, 'user.delete', 'user', req.params.id, { username: target?.username || null });
+  })();
   res.json({ success: true });
 });
 
@@ -226,9 +240,13 @@ router.post('/:id/post-pay', adminIpGuard, (req, res) => {
   const next = (req.body && req.body.post_pay !== undefined)
     ? (req.body.post_pay ? 1 : 0)
     : (user.post_pay ? 0 : 1);
-  db.prepare('UPDATE users SET post_pay = ? WHERE id = ?').run(next, req.params.id);
+  let fresh;
+  db.transaction(() => {
+    db.prepare('UPDATE users SET post_pay = ? WHERE id = ?').run(next, req.params.id);
+    audit(req, 'user.post-pay', 'user', req.params.id, { post_pay: next });
+    fresh = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  })();
   // Push the updated state to any connected client + every admin view.
-  const fresh = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
   syncClientCredits(req, req.params.id, fresh.credits, fresh.debt);
   res.json({ post_pay: next, credits: fresh.credits, debt: fresh.debt });
 });
@@ -244,10 +262,14 @@ router.post('/:id/charge', adminIpGuard, (req, res) => {
   if (free) {
     const amt = Number(amount);
     const desc = description || '🎁 شارژ رایگان (هدیه ادمین)';
-    db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(amt, req.params.id);
-    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-      .run(req.params.id, amt, 'free_gift', desc);
-    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    let user;
+    db.transaction(() => {
+      db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(amt, req.params.id);
+      db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+        .run(req.params.id, amt, 'free_gift', desc);
+      audit(req, 'user.charge.free', 'user', req.params.id, { amount: amt, description: desc });
+      user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    })();
     syncClientCredits(req, req.params.id, user.credits, user.debt);
     return res.json({ credits: user.credits, bonus: 0, discount: 0, free: true });
   }
@@ -258,12 +280,15 @@ router.post('/:id/charge', adminIpGuard, (req, res) => {
     ? `شارژ ${Number(amount).toLocaleString()} ریال + ${bonus.toLocaleString()} ریال تخفیف (${discount}%)`
     : 'شارژ دستی توسط ادمین');
 
-  db.prepare('UPDATE users SET credits = credits + ?, total_spent = total_spent + ? WHERE id = ?')
-    .run(total, Number(amount), req.params.id);
-  db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-    .run(req.params.id, total, 'charge', desc);
-
-  const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  let user;
+  db.transaction(() => {
+    db.prepare('UPDATE users SET credits = credits + ?, total_spent = total_spent + ? WHERE id = ?')
+      .run(total, Number(amount), req.params.id);
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(req.params.id, total, 'charge', desc);
+    audit(req, 'user.charge', 'user', req.params.id, { requested: Number(amount), total, bonus, discount, description: desc });
+    user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  })();
   syncClientCredits(req, req.params.id, user.credits, user.debt);
   res.json({ credits: user.credits, bonus, discount });
 });
@@ -272,11 +297,14 @@ router.post('/:id/charge', adminIpGuard, (req, res) => {
 router.post('/:id/decharge', adminIpGuard, (req, res) => {
   const { amount, description = 'کاهش شارژ توسط ادمین' } = req.body;
   const db = getDb();
-  db.prepare('UPDATE users SET credits = MAX(0, credits - ?) WHERE id = ?').run(Number(amount), req.params.id);
-  db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-    .run(req.params.id, -Number(amount), 'decharge', description);
-
-  const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  let user;
+  db.transaction(() => {
+    db.prepare('UPDATE users SET credits = MAX(0, credits - ?) WHERE id = ?').run(Number(amount), req.params.id);
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(req.params.id, -Number(amount), 'decharge', description);
+    audit(req, 'user.decharge', 'user', req.params.id, { amount: Number(amount), description });
+    user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  })();
   syncClientCredits(req, req.params.id, user.credits, user.debt);
   res.json({ credits: user.credits });
 });
@@ -288,12 +316,15 @@ router.post('/:id/debt/add', adminIpGuard, (req, res) => {
   const current = db.prepare('SELECT debt FROM users WHERE id = ?').get(req.params.id);
   const wasZero = !current || current.debt <= 0;
 
-  db.prepare('UPDATE users SET debt = debt + ?' + (wasZero ? ', debt_since = CURRENT_TIMESTAMP' : '') + ' WHERE id = ?')
-    .run(Number(amount), req.params.id);
-  db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-    .run(req.params.id, Number(amount), 'debt_add', description);
-
-  const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  let user;
+  db.transaction(() => {
+    db.prepare('UPDATE users SET debt = debt + ?' + (wasZero ? ', debt_since = CURRENT_TIMESTAMP' : '') + ' WHERE id = ?')
+      .run(Number(amount), req.params.id);
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(req.params.id, Number(amount), 'debt_add', description);
+    audit(req, 'user.debt.add', 'user', req.params.id, { amount: Number(amount), description });
+    user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  })();
   notifyClient(req, req.params.id, 'credits:update', { credits: user.credits, debt: user.debt });
   res.json({ debt: user.debt });
 });
@@ -302,16 +333,18 @@ router.post('/:id/debt/add', adminIpGuard, (req, res) => {
 router.post('/:id/debt/pay', adminIpGuard, (req, res) => {
   const { amount, description = 'پرداخت بدهی' } = req.body;
   const db = getDb();
-  db.prepare('UPDATE users SET debt = MAX(0, debt - ?) WHERE id = ?').run(Number(amount), req.params.id);
-
-  const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
-  if (user.debt <= 0) {
-    db.prepare('UPDATE users SET debt = 0, debt_since = NULL WHERE id = ?').run(req.params.id);
-  }
-  db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-    .run(req.params.id, -Number(amount), 'debt_pay', description);
-
-  const updated = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  let updated;
+  db.transaction(() => {
+    db.prepare('UPDATE users SET debt = MAX(0, debt - ?) WHERE id = ?').run(Number(amount), req.params.id);
+    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    if (user.debt <= 0) {
+      db.prepare('UPDATE users SET debt = 0, debt_since = NULL WHERE id = ?').run(req.params.id);
+    }
+    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+      .run(req.params.id, -Number(amount), 'debt_pay', description);
+    audit(req, 'user.debt.pay', 'user', req.params.id, { amount: Number(amount), description });
+    updated = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+  })();
   notifyClient(req, req.params.id, 'credits:update', { credits: updated.credits, debt: updated.debt });
   res.json({ debt: updated.debt });
 });

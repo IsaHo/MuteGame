@@ -12,7 +12,7 @@ const gamesRoutes = require('./routes/games');
 const networkRoutes = require('./routes/network');
 const adminsRoutes = require('./routes/admins');
 const auditRoutes = require('./routes/audit');
-const { attachAdmin } = require('./audit');
+const { attachAdmin, audit } = require('./audit');
 
 // Shared secret loader: validates the env var and refuses to boot if missing
 // or too short. The previous fallback literal made every issued token forgeable
@@ -91,11 +91,15 @@ app.get('/api/clients', (req, res) => {
 
 app.post('/api/clients/:socketId/kick', requireAdmin, requireAdminIp, (req, res) => {
   const client = connectedClients.get(req.params.socketId);
-  if (client) {
-    if (client.userId) {
-      const db = getDb();
+  const db = getDb();
+  const targetUserId = client?.userId || null;
+  db.transaction(() => {
+    if (client && client.userId) {
       db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(client.userId);
     }
+    audit(req, 'client.kick', 'client', req.params.socketId, { userId: targetUserId, computerName: client?.computerName });
+  })();
+  if (client) {
     client.userId = null;
     client.username = null;
     client.credits = 0;
@@ -108,6 +112,10 @@ app.post('/api/clients/:socketId/kick', requireAdmin, requireAdminIp, (req, res)
 });
 
 app.post('/api/clients/:socketId/message', requireAdmin, requireAdminIp, (req, res) => {
+  const db = getDb();
+  db.transaction(() => {
+    audit(req, 'client.message', 'client', req.params.socketId, { text: String(req.body.text || '').slice(0, 500) });
+  })();
   io.to(req.params.socketId).emit('admin:message', { text: req.body.text });
   res.json({ success: true });
 });
@@ -117,8 +125,12 @@ app.post('/api/clients/:socketId/extend', requireAdmin, requireAdminIp, (req, re
   const client = Array.from(connectedClients.values()).find(c => c.socketId === req.params.socketId);
   if (client && client.userId) {
     const db = getDb();
-    db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(minutes, client.userId);
-    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(client.userId);
+    let user;
+    db.transaction(() => {
+      db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(minutes, client.userId);
+      audit(req, 'client.extend', 'user', client.userId, { socketId: req.params.socketId, computerName: client.computerName, minutes: Number(minutes) });
+      user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(client.userId);
+    })();
     client.credits = user.credits;
     io.to(req.params.socketId).emit('credits:update', { credits: user.credits, debt: user.debt });
     io.emit('clients:update', Array.from(connectedClients.values()));
@@ -133,11 +145,15 @@ app.post('/api/clients/:socketId/force-login', requireAdmin, requireAdminIp, (re
   const client = connectedClients.get(req.params.socketId);
   if (!client) return res.status(404).json({ error: 'PC پیدا نشد' });
   const db = getDb();
-  // Close any open session for this user, then start a new one on this PC
-  db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(userId);
-  db.prepare('INSERT INTO sessions (user_id, computer_name) VALUES (?, ?)').run(userId, client.computerName);
-  db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  let user;
+  db.transaction(() => {
+    // Close any open session for this user, then start a new one on this PC
+    db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(userId);
+    db.prepare('INSERT INTO sessions (user_id, computer_name) VALUES (?, ?)').run(userId, client.computerName);
+    db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
+    audit(req, 'client.force-login', 'user', userId, { socketId: req.params.socketId, computerName: client.computerName, username });
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  })();
   client.userId = userId;
   client.username = username || user.username;
   client.credits = user.credits;
@@ -157,6 +173,10 @@ app.post('/api/clients/:socketId/force-login', requireAdmin, requireAdminIp, (re
 app.post('/api/clients/:socketId/voice-mute', requireAdmin, requireAdminIp, (req, res) => {
   const c = connectedClients.get(req.params.socketId);
   if (!c) return res.status(404).json({ error: 'PC پیدا نشد' });
+  const db = getDb();
+  db.transaction(() => {
+    audit(req, 'client.voice-mute', 'client', req.params.socketId, { muted: !!req.body.muted, computerName: c.computerName });
+  })();
   c.voiceMuted = !!req.body.muted;
   io.to(req.params.socketId).emit('voice:mute-toggle', { muted: c.voiceMuted });
   io.emit('clients:update', Array.from(connectedClients.values()));
@@ -168,6 +188,11 @@ app.post('/api/clients/:socketId/power', requireAdmin, requireAdminIp, (req, res
   const { action } = req.body;
   if (!['lock', 'restart', 'shutdown'].includes(action))
     return res.status(400).json({ error: 'action نامعتبر' });
+  const db = getDb();
+  const client = connectedClients.get(req.params.socketId);
+  db.transaction(() => {
+    audit(req, 'client.power', 'client', req.params.socketId, { action, computerName: client?.computerName });
+  })();
   io.to(req.params.socketId).emit('admin:power', { action });
   res.json({ success: true });
 });

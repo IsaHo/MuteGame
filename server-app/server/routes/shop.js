@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../database');
+const { audit } = require('../audit');
 
 // Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
 // (defense-in-depth). Both must pass for the route to run.
@@ -29,9 +30,13 @@ router.get('/items', (req, res) => {
 router.post('/items', adminIpGuard, (req, res) => {
   const { name, price, buy_price = 0, category, emoji, stock } = req.body;
   const db = getDb();
-  const result = db.prepare(
-    'INSERT INTO shop_items (name, price, buy_price, category, emoji, stock) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(name, price, buy_price, category || 'food', emoji || '🍔', stock ?? -1);
+  let result;
+  db.transaction(() => {
+    result = db.prepare(
+      'INSERT INTO shop_items (name, price, buy_price, category, emoji, stock) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(name, price, buy_price, category || 'food', emoji || '🍔', stock ?? -1);
+    audit(req, 'shop.item.create', 'shop_item', result.lastInsertRowid, { name, price, buy_price, category, stock });
+  })();
   broadcastShopItems(req);
   res.json({ id: result.lastInsertRowid });
 });
@@ -39,9 +44,12 @@ router.post('/items', adminIpGuard, (req, res) => {
 router.put('/items/:id', adminIpGuard, (req, res) => {
   const { name, price, buy_price = 0, category, emoji, stock, active } = req.body;
   const db = getDb();
-  db.prepare(
-    'UPDATE shop_items SET name=?, price=?, buy_price=?, category=?, emoji=?, stock=?, active=? WHERE id=?'
-  ).run(name, price, buy_price, category, emoji, stock, active ?? 1, req.params.id);
+  db.transaction(() => {
+    db.prepare(
+      'UPDATE shop_items SET name=?, price=?, buy_price=?, category=?, emoji=?, stock=?, active=? WHERE id=?'
+    ).run(name, price, buy_price, category, emoji, stock, active ?? 1, req.params.id);
+    audit(req, 'shop.item.update', 'shop_item', req.params.id, { name, price, buy_price, category, stock, active });
+  })();
   broadcastShopItems(req);
   res.json({ success: true });
 });
@@ -50,7 +58,10 @@ router.delete('/items/:id', adminIpGuard, (req, res) => {
   const db = getDb();
   // Soft-delete (preserves history for past orders) but the broadcast list
   // filters active=1 so the client immediately sees it disappear.
-  db.prepare('UPDATE shop_items SET active = 0 WHERE id = ?').run(req.params.id);
+  db.transaction(() => {
+    db.prepare('UPDATE shop_items SET active = 0 WHERE id = ?').run(req.params.id);
+    audit(req, 'shop.item.delete', 'shop_item', req.params.id, { mode: 'soft' });
+  })();
   broadcastShopItems(req);
   res.json({ success: true });
 });
@@ -109,36 +120,45 @@ router.post('/orders/:id/approve', adminIpGuard, (req, res) => {
   if (order.status !== 'pending') return res.status(400).json({ error: 'این سفارش قبلاً پردازش شده' });
 
   const items = JSON.parse(order.items);
+  let updatedUser = null;
 
-  // Deduct stock
-  for (const item of items) {
-    const dbItem = db.prepare('SELECT stock FROM shop_items WHERE id = ?').get(item.id);
-    if (dbItem && dbItem.stock !== -1) {
-      db.prepare('UPDATE shop_items SET stock = MAX(0, stock - ?) WHERE id = ?').run(item.qty, item.id);
+  db.transaction(() => {
+    // Deduct stock
+    for (const item of items) {
+      const dbItem = db.prepare('SELECT stock FROM shop_items WHERE id = ?').get(item.id);
+      if (dbItem && dbItem.stock !== -1) {
+        db.prepare('UPDATE shop_items SET stock = MAX(0, stock - ?) WHERE id = ?').run(item.qty, item.id);
+      }
     }
-  }
 
-  // Deduct credits if credits payment
-  if (order.payment_method === 'credits' && order.user_id) {
-    const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(order.user_id);
-    if (user && user.credits >= order.total) {
-      db.prepare('UPDATE users SET credits = credits - ? WHERE id = ?').run(order.total, order.user_id);
-      db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-        .run(order.user_id, -order.total, 'shop', `خرید از شاپ: ${items.map(i => i.name).join(', ')}`);
-
-      const updatedUser = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(order.user_id);
-      connectedClients.forEach((client, socketId) => {
-        if (client.userId == order.user_id) {
-          client.credits = updatedUser.credits;
-          io.to(socketId).emit('credits:update', { credits: updatedUser.credits, debt: updatedUser.debt });
-        }
-      });
+    if (order.payment_method === 'credits' && order.user_id) {
+      const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(order.user_id);
+      if (user && user.credits >= order.total) {
+        db.prepare('UPDATE users SET credits = credits - ? WHERE id = ?').run(order.total, order.user_id);
+        db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
+          .run(order.user_id, -order.total, 'shop', `خرید از شاپ: ${items.map(i => i.name).join(', ')}`);
+        updatedUser = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(order.user_id);
+      }
     }
+
+    db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('completed', req.params.id);
+    audit(req, 'shop.order.approve', 'shop_order', req.params.id, {
+      total: order.total,
+      payment_method: order.payment_method,
+      user_id: order.user_id,
+      items: items.map(i => ({ id: i.id, name: i.name, qty: i.qty, price: i.price })),
+      credits_deducted: order.payment_method === 'credits' && updatedUser ? order.total : 0,
+    });
+  })();
+
+  if (updatedUser) {
+    connectedClients.forEach((client, socketId) => {
+      if (client.userId == order.user_id) {
+        client.credits = updatedUser.credits;
+        io.to(socketId).emit('credits:update', { credits: updatedUser.credits, debt: updatedUser.debt });
+      }
+    });
   }
-
-  db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('completed', req.params.id);
-
-  // Notify the client their order was approved
   connectedClients.forEach((client, socketId) => {
     if (client.userId == order.user_id) {
       io.to(socketId).emit('order:approved', { orderId: order.id });
@@ -159,7 +179,10 @@ router.post('/orders/:id/cancel', adminIpGuard, (req, res) => {
   if (!order) return res.status(404).json({ error: 'سفارش پیدا نشد' });
   if (order.status !== 'pending') return res.status(400).json({ error: 'این سفارش قبلاً پردازش شده' });
 
-  db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('cancelled', req.params.id);
+  db.transaction(() => {
+    db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('cancelled', req.params.id);
+    audit(req, 'shop.order.cancel', 'shop_order', req.params.id, { total: order.total, user_id: order.user_id });
+  })();
 
   connectedClients.forEach((client, socketId) => {
     if (client.userId == order.user_id) {
