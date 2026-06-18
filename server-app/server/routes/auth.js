@@ -4,7 +4,12 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { getDb } = require('../database');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'mutegame_jwt_secret_2024';
+const JWT_SECRET = require('../jwt-secret');
+
+function normalizeIp(ip) {
+  if (!ip) return '';
+  return String(ip).replace(/^::ffff:/, '').replace(/^::1$/, '127.0.0.1');
+}
 
 router.post('/admin/login', (req, res) => {
   const { username, password } = req.body;
@@ -13,8 +18,26 @@ router.post('/admin/login', (req, res) => {
   if (!admin || !bcrypt.compareSync(password, admin.password)) {
     return res.status(401).json({ error: 'نام کاربری یا رمز عبور اشتباه است' });
   }
+  // First successful admin login pins admin_ip; can be cleared from admin panel.
+  const reqIp = normalizeIp(req.ip);
+  const existing = db.prepare("SELECT value FROM settings WHERE key = 'admin_ip'").get()?.value;
+  if (!existing && reqIp) {
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('admin_ip', ?, CURRENT_TIMESTAMP)").run(reqIp);
+  }
   const token = jwt.sign({ id: admin.id, role: 'admin' }, JWT_SECRET, { expiresIn: '24h' });
-  res.json({ token, username: admin.username });
+  res.json({ token, username: admin.username, adminIp: existing || reqIp });
+});
+
+router.post('/admin/reset-admin-ip', (req, res) => {
+  const { username, password } = req.body;
+  const db = getDb();
+  const admin = db.prepare('SELECT * FROM admins WHERE username = ?').get(username);
+  if (!admin || !bcrypt.compareSync(password, admin.password)) {
+    return res.status(401).json({ error: 'نام کاربری یا رمز عبور اشتباه است' });
+  }
+  const reqIp = normalizeIp(req.ip);
+  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('admin_ip', ?, CURRENT_TIMESTAMP)").run(reqIp);
+  res.json({ success: true, adminIp: reqIp });
 });
 
 router.post('/client/login', (req, res) => {

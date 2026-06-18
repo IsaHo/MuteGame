@@ -14,10 +14,10 @@ const adminsRoutes = require('./routes/admins');
 const auditRoutes = require('./routes/audit');
 const { attachAdmin } = require('./audit');
 
-// Same secret used by routes/auth.js and audit.js attachAdmin. Production must
-// set JWT_SECRET via env — the fallback is for dev only and is itself flagged
-// as a separate finding.
-const JWT_SECRET = process.env.JWT_SECRET || 'mutegame_jwt_secret_2024';
+// Shared secret loader: validates the env var and refuses to boot if missing
+// or too short. The previous fallback literal made every issued token forgeable
+// by anyone who could read the source.
+const JWT_SECRET = require('./jwt-secret');
 
 const app = express();
 const server = http.createServer(app);
