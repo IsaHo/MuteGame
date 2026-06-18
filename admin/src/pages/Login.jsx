@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
+import { refreshSocketAuth } from '../socket';
 
 export default function Login() {
   const [form, setForm] = useState({ username: '', password: '' });
@@ -16,6 +17,9 @@ export default function Login() {
       const data = await api.adminLogin(form.username, form.password);
       localStorage.setItem('mg_token', data.token);
       localStorage.setItem('mg_admin', data.username);
+      // Reconnect socket so the server tags it as admin and voice:* + future
+      // admin-only events become callable from this dashboard session.
+      refreshSocketAuth();
       navigate('/');
     } catch (e) {
       setErr(e.message);

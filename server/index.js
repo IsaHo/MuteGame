@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 const { initDatabase, getDb } = require('./database');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
@@ -12,6 +13,11 @@ const networkRoutes = require('./routes/network');
 const adminsRoutes = require('./routes/admins');
 const auditRoutes = require('./routes/audit');
 const { attachAdmin } = require('./audit');
+
+// Same secret used by routes/auth.js and audit.js attachAdmin. Production must
+// set JWT_SECRET via env — the fallback is for dev only and is itself flagged
+// as a separate finding.
+const JWT_SECRET = process.env.JWT_SECRET || 'mutegame_jwt_secret_2024';
 
 const app = express();
 const server = http.createServer(app);
@@ -262,8 +268,31 @@ app.get('/api/sessions', (req, res) => {
   res.json(sessions);
 });
 
+// ─── Socket.IO handshake auth ─────────────────────────────────────
+// Tags admin sockets with `socket.data.isAdmin = true` when a valid admin JWT
+// is presented. Never rejects — kiosk clients connect without tokens. Admin-
+// only events (voice:*, admin:* relays) gate on socket.data.isAdmin.
+io.use((socket, next) => {
+  const token = socket.handshake.auth && socket.handshake.auth.token;
+  if (token) {
+    try {
+      const p = jwt.verify(token, JWT_SECRET);
+      if (p && (p.role === 'admin' || p.role === 'super')) {
+        socket.data.isAdmin = true;
+        socket.data.adminId = p.id;
+      }
+    } catch {}
+  }
+  next();
+});
+
 // Socket.IO
 io.on('connection', (socket) => {
+  // Drop any admin-emitted event from a non-admin socket.
+  const adminOnly = (handler) => (...args) => {
+    if (!socket.data.isAdmin) return;
+    return handler(...args);
+  };
   console.log('🔌 Socket connected:', socket.id);
 
   socket.on('client:register', (data) => {
@@ -374,22 +403,22 @@ io.on('connection', (socket) => {
    * Client can opt-out by emitting `voice:mute` (server stores the flag and
    * blocks further chunks until `voice:unmute`).
    */
-  socket.on('voice:start', ({ targetSocketId }) => {
+  socket.on('voice:start', adminOnly(({ targetSocketId }) => {
     if (!targetSocketId) return;
     const target = connectedClients.get(targetSocketId);
     if (target?.voiceMuted) return; // client muted incoming voice
     io.to(targetSocketId).emit('voice:incoming-start', { from: socket.id });
-  });
-  socket.on('voice:chunk', ({ targetSocketId, audio, mime }) => {
+  }));
+  socket.on('voice:chunk', adminOnly(({ targetSocketId, audio, mime }) => {
     if (!targetSocketId || !audio) return;
     const target = connectedClients.get(targetSocketId);
     if (target?.voiceMuted) return;
     io.to(targetSocketId).emit('voice:incoming-chunk', { from: socket.id, audio, mime });
-  });
-  socket.on('voice:stop', ({ targetSocketId }) => {
+  }));
+  socket.on('voice:stop', adminOnly(({ targetSocketId }) => {
     if (!targetSocketId) return;
     io.to(targetSocketId).emit('voice:incoming-stop', { from: socket.id });
-  });
+  }));
   socket.on('voice:mute', () => {
     const c = connectedClients.get(socket.id);
     if (c) { c.voiceMuted = true; io.emit('clients:update', Array.from(connectedClients.values())); }
