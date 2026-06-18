@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, shell, Menu, globalShortcut, screen, dialog, powerSaveBlocker } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { exec, execFile } = require('child_process');
 
 // ─── Network input validation ────────────────────────────────────────
@@ -37,8 +38,42 @@ function runApplyDnsPs(primary, secondary, timeoutMs = 5000) {
   });
 }
 
-// ─── Admin exit password (kiosk only). CHANGE THIS BEFORE DEPLOYING. ──
-const ADMIN_EXIT_PASSWORD = 'admin';
+// ─── Admin exit password store (kiosk only) ─────────────────────────
+// Salted scrypt in `userData/admin.json`. No literal default — if the file
+// is missing the kiosk REFUSES to apply lockdown (so a fresh install can't
+// trap the operator without an exit code). First-run setup writes the file
+// via the `admin-set-initial-password` IPC.
+const ADMIN_CREDS_PATH = path.join(app.getPath('userData'), 'admin.json');
+const SCRYPT_KEYLEN = 32;
+function hashPassword(plain, saltHex) {
+  return crypto.scryptSync(String(plain), Buffer.from(saltHex, 'hex'), SCRYPT_KEYLEN).toString('hex');
+}
+function loadAdminCreds() {
+  try {
+    const j = JSON.parse(fs.readFileSync(ADMIN_CREDS_PATH, 'utf8'));
+    if (j && typeof j.salt === 'string' && typeof j.hash === 'string') return j;
+  } catch {}
+  return null;
+}
+function saveAdminCreds(plain) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = hashPassword(plain, salt);
+  fs.writeFileSync(ADMIN_CREDS_PATH, JSON.stringify({ salt, hash, ver: 1 }, null, 2), { mode: 0o600 });
+}
+function verifyAdminPwd(plain) {
+  const creds = loadAdminCreds();
+  if (!creds || !plain) return false;
+  let h;
+  try { h = Buffer.from(hashPassword(plain, creds.salt), 'hex'); } catch { return false; }
+  const exp = Buffer.from(creds.hash, 'hex');
+  return h.length === exp.length && crypto.timingSafeEqual(h, exp);
+}
+// Short-lived "recently verified" flag — set on successful verify, consumed
+// by `admin-shutdown` so AdminPanel's full-exit doesn't need to round-trip
+// the plaintext password through extra IPCs.
+let adminVerifiedUntil = 0;
+function markAdminVerified() { adminVerifiedUntil = Date.now() + 5 * 60 * 1000; }
+function isAdminRecentlyVerified() { return Date.now() < adminVerifiedUntil; }
 
 const CONFIG_PATH = path.join(app.getPath('userData'), 'config.json');
 // Per-PC cache of resolved game .exe paths. Keyed by server-side game id so
@@ -577,35 +612,47 @@ function stopSleepBlock() {
   }
 }
 
+// Apply the full Windows kiosk lockdown. Split out so first-run (no admin
+// creds yet) can defer it until the operator has set an exit password.
+let lockdownApplied = false;
+function applyKioskLockdown() {
+  if (!KIOSK || lockdownApplied) return;
+  lockdownApplied = true;
+  setAutoStart(true);
+  applyLockdownPolicies(true);
+  // Full kiosk (CCBoot-style): kill explorer so taskbar/start-menu vanish
+  // for every kiosk session. We do NOT replace the Winlogon Shell
+  // (too risky — a moved .exe locks the user out of Windows) but we DO
+  // remove the desktop UI so the launcher is the only visible app.
+  // explorer.exe is restored on admin-exit via restoreExplorer().
+  setTimeout(killExplorer, 1500);
+  // Re-kill explorer every 30s in case Windows tries to relaunch it
+  setInterval(() => {
+    try { exec('tasklist /fi "imagename eq explorer.exe" /nh', (err, out) => {
+      if (!err && out && /explorer\.exe/i.test(out)) exec('taskkill /f /im explorer.exe', () => {});
+    }); } catch {}
+  }, 30000);
+
+  const cfg = loadConfig();
+  if (cfg.strictKioskShell === true) {
+    // Optional: also replace Winlogon Shell so Windows boots straight into
+    // this exe (no logon to desktop at all). Only enable when you're sure
+    // the .exe path is final.
+    setShellAsClient(true);
+  }
+}
+
 app.whenReady().then(() => {
   createAllWindows();
   registerLockdownShortcuts();
   startSleepBlock();
 
-  if (KIOSK) {
-    setAutoStart(true);
-    applyLockdownPolicies(true);
-    // Full kiosk (CCBoot-style): kill explorer so taskbar/start-menu vanish
-    // for every kiosk session. We do NOT replace the Winlogon Shell
-    // (too risky — a moved .exe locks the user out of Windows) but we DO
-    // remove the desktop UI so the launcher is the only visible app.
-    // explorer.exe is restored on admin-exit via restoreExplorer().
-    setTimeout(killExplorer, 1500);
-    // Re-kill explorer every 30s in case Windows tries to relaunch it
-    setInterval(() => {
-      try { exec('tasklist /fi "imagename eq explorer.exe" /nh', (err, out) => {
-        if (!err && out && /explorer\.exe/i.test(out)) exec('taskkill /f /im explorer.exe', () => {});
-      }); } catch {}
-    }, 30000);
-
-    const cfg = loadConfig();
-    if (cfg.strictKioskShell === true) {
-      // Optional: also replace Winlogon Shell so Windows boots straight into
-      // this exe (no logon to desktop at all). Only enable when you're sure
-      // the .exe path is final.
-      setShellAsClient(true);
-    }
-  }
+  // Defer lockdown when no admin exit password has been configured yet.
+  // Otherwise a fresh install with KIOSK=true would trap the operator with
+  // no way to escape. The renderer shows a setup screen on first run and
+  // calls `admin-set-initial-password`, which then triggers lockdown.
+  if (KIOSK && loadAdminCreds()) applyKioskLockdown();
+  else if (KIOSK) console.warn('[kiosk] no admin.json — lockdown deferred until first-run setup completes');
 
   screen.on('display-added', () => rebuildOverlays());
   screen.on('display-removed', () => rebuildOverlays());
@@ -655,13 +702,41 @@ app.whenReady().then(() => {
   ipcMain.handle('minimize', () => { if (!KIOSK) mainWin?.minimize(); });
 
   ipcMain.handle('quit-app', (_, password) => {
-    const ok = password === ADMIN_EXIT_PASSWORD;
-    if (ok) shutdownAndExit();
+    const ok = verifyAdminPwd(password);
+    if (ok) { markAdminVerified(); shutdownAndExit(); }
     return ok;
   });
 
   // ─── Admin panel IPCs ────────────────────────────────────────────────
-  ipcMain.handle('verify-admin-password', (_, password) => password === ADMIN_EXIT_PASSWORD);
+  ipcMain.handle('verify-admin-password', (_, password) => {
+    const ok = verifyAdminPwd(password);
+    if (ok) markAdminVerified();
+    return ok;
+  });
+
+  // First-run setup. Returns true only when no admin password is configured
+  // — so the renderer can render the setup screen on cold start.
+  ipcMain.handle('admin-setup-required', () => !loadAdminCreds());
+  ipcMain.handle('admin-set-initial-password', (_, password) => {
+    if (loadAdminCreds()) return { ok: false, error: 'رمز ادمین قبلاً تنظیم شده است' };
+    if (typeof password !== 'string' || password.length < 6) {
+      return { ok: false, error: 'رمز باید حداقل ۶ کاراکتر باشد' };
+    }
+    try {
+      saveAdminCreds(password);
+      // Lockdown was deferred when there were no creds — apply it now.
+      applyKioskLockdown();
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  // Caller already passed verify-admin-password within the last 5 minutes.
+  // Skips the password round-trip from AdminPanel's full-exit button.
+  ipcMain.handle('admin-shutdown', () => {
+    if (!isAdminRecentlyVerified()) return { ok: false, error: 'لطفاً ابتدا رمز ادمین را وارد کن' };
+    shutdownAndExit();
+    return { ok: true };
+  });
 
   // Toggle launcher lockdown without quitting. enabled=false un-applies all
   // policies, restores explorer, removes auto-start; enabled=true re-applies.
