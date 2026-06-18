@@ -18,6 +18,12 @@ const HOSTNAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$/;
 function isValidHost(s) {
   return typeof s === 'string' && (IPV4_RE.test(s) || HOSTNAME_RE.test(s));
 }
+// Executable name as it appears in the games table. Server-supplied; we never
+// pass it to a shell. Format: basename only (no slashes), known extension.
+const EXE_NAME_RE = /^[A-Za-z0-9._-]+\.(exe|bat|cmd|lnk)$/i;
+function isValidExeName(s) {
+  return typeof s === 'string' && EXE_NAME_RE.test(s);
+}
 
 // Build the DNS-apply PowerShell script. Values are validated by the caller;
 // execFile bypasses cmd.exe, so the only parser left is PowerShell itself.
@@ -188,7 +194,14 @@ function startGameMonitor() {
       if (!gameSessionActive || !activeGameExeName) {
         clearInterval(gameMonitorTimer); gameMonitorTimer = null; return;
       }
-      exec(`tasklist /fi "imagename eq ${activeGameExeName}" /fo csv /nh`, (err, stdout) => {
+      // Validate before passing to tasklist — activeGameExeName ultimately
+      // derives from a server-pushed games row. execFile + argv avoids cmd
+      // parsing, the regex blocks anything outside the basename charset.
+      if (!isValidExeName(activeGameExeName)) {
+        exitGameSession();
+        return;
+      }
+      execFile('tasklist', ['/fi', `imagename eq ${activeGameExeName}`, '/fo', 'csv', '/nh'], (err, stdout) => {
         if (err) return;
         const alive = (stdout || '').toLowerCase().includes(activeGameExeName);
         if (alive) {
@@ -837,10 +850,13 @@ app.whenReady().then(() => {
       } catch {}
     }
 
-    // 3) Use Windows `where` as last resort (only if exeName is on PATH)
+    // 3) Use Windows `where` as last resort (only if exeName is on PATH).
+    // JSON.stringify is NOT sufficient cmd-quoting — switch to execFile so
+    // there is no shell at all, and validate the basename first.
     if (process.platform === 'win32') {
+      if (!isValidExeName(exeName)) return { found: false };
       const whereResult = await new Promise(res => {
-        exec(`where ${JSON.stringify(exeName)}`, { timeout: 4000 }, (err, stdout) => {
+        execFile('where', [exeName], { timeout: 4000 }, (err, stdout) => {
           if (err) return res(null);
           const first = String(stdout || '').split('\n').map(x => x.trim()).filter(Boolean)[0];
           res(first || null);
@@ -998,8 +1014,13 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('kill-process', (_, pid) => {
-    if (!pid || process.platform !== 'win32') return { ok: false };
-    return new Promise(r => exec(`taskkill /pid ${pid} /f`, { timeout: 3000 }, (err) => r({ ok: !err, error: err?.message })));
+    if (process.platform !== 'win32') return { ok: false };
+    // pid comes from the renderer (process list it just rendered). Validate
+    // strictly — without this, any string with shell metachars would land
+    // straight in cmd.exe via exec().
+    const n = Number(pid);
+    if (!Number.isInteger(n) || n <= 0 || n > 0xffffffff) return { ok: false };
+    return new Promise(r => execFile('taskkill', ['/pid', String(n), '/f'], { timeout: 3000 }, (err) => r({ ok: !err, error: err?.message })));
   });
 });
 

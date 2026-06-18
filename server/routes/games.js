@@ -270,11 +270,17 @@ router.get('/', (req, res) => {
   res.json(rows);
 });
 
+// Defense-in-depth: the kiosk client refuses to subprocess anything that
+// doesn't look like a basename + known extension, so we reject the same
+// pattern at the boundary instead of letting bad data into the games row.
+const EXE_NAME_RE = /^[A-Za-z0-9._-]+\.(exe|bat|cmd|lnk)$/i;
+
 // ── Create
 router.post('/', requireAdmin('games.edit'), (req, res) => {
   const { name, exe_name, category = 'all', sort_order = 0, hint_path = '', is_launcher = 0,
           active = 1 } = req.body;
   if (!name || !exe_name) return res.status(400).json({ error: 'نام و exe_name الزامی است' });
+  if (!EXE_NAME_RE.test(exe_name)) return res.status(400).json({ error: 'exe_name نامعتبر است (فقط نام فایل با پسوند .exe/.bat/.cmd/.lnk)' });
   const db = getDb();
   const info = db.prepare(
     `INSERT INTO games (name, exe_name, category, sort_order, hint_path, is_launcher, active) VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -296,6 +302,9 @@ router.post('/', requireAdmin('games.edit'), (req, res) => {
 // ── Update
 router.put('/:id', requireAdmin('games.edit'), (req, res) => {
   const { name, exe_name, category, sort_order, hint_path, active, is_launcher } = req.body;
+  if (exe_name !== undefined && exe_name !== null && !EXE_NAME_RE.test(exe_name)) {
+    return res.status(400).json({ error: 'exe_name نامعتبر است (فقط نام فایل با پسوند .exe/.bat/.cmd/.lnk)' });
+  }
   const db = getDb();
   const exists = db.prepare('SELECT id FROM games WHERE id = ?').get(req.params.id);
   if (!exists) return res.status(404).json({ error: 'بازی پیدا نشد' });
