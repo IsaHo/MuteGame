@@ -408,6 +408,17 @@ function initDatabase() {
     prepBillingMigration(db);
   } catch (e) { console.error('billing-prep:', e.stack || e.message); throw e; }
 
+  // ─── Billing schema v2 (Phase 2) ─────────────────────────────────────
+  // The structural migration. Adds the new sessions columns, the partial
+  // UNIQUE INDEX that enforces "one open session per seat", the
+  // credit_ledger table with arithmetic CHECKs + append-only triggers,
+  // recreates `users` with credits/debt/total CHECKs, and seeds the new
+  // billing settings. Idempotent: each step probes current schema state
+  // and is a no-op once applied. See section §1 of the Phase 2 spec.
+  try {
+    applyBillingSchemaV2(db);
+  } catch (e) { console.error('billing-schema-v2:', e.stack || e.message); throw e; }
+
   console.log('✅ Database ready');
 }
 
@@ -520,4 +531,328 @@ function prepBillingMigration(db) {
   return report;
 }
 
-module.exports = { initDatabase, getDb, prepBillingMigration };
+/*
+ * Phase 2 — billing-schema-v2. Idempotent structural migration.
+ *
+ * Each of S1..S7 is gated by a schema-state probe (PRAGMA table_info /
+ * sqlite_master / settings key presence) so re-running the function on
+ * a fully-migrated DB is a complete no-op. Crashes mid-step roll back
+ * atomically via WAL; the next boot resumes from the first not-yet-
+ * applied step. See the Phase 2 spec for the locking/runtime matrix.
+ *
+ * Public for testability — fixture and real-snapshot tests invoke this
+ * directly outside of initDatabase().
+ */
+function applyBillingSchemaV2(db) {
+  const report = {
+    started_at: new Date().toISOString(),
+    sessions_columns_added: [],
+    indexes_created: [],
+    tables_created: [],
+    triggers_created: [],
+    users_rebuilt: false,
+    users_rebuilt_rows: 0,
+    settings_inserted: [],
+    clock_warp_probe: 'skipped (empty ledger)',
+  };
+
+  // ── S1. Add sessions columns ────────────────────────────────────────
+  // Additive ALTERs are individually atomic. Each gate is a column-name
+  // probe so partial application (crash mid-list) resumes cleanly.
+  const sessionCols = db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name);
+  const sessionAdds = [
+    ['session_uuid',         'TEXT'],
+    ['seat_slot',            'INTEGER NOT NULL DEFAULT 0'],
+    ['state',                "TEXT NOT NULL DEFAULT 'closed'"],
+    ['last_billed_at',       'DATETIME'],
+    ['unpaid_micros',        'INTEGER NOT NULL DEFAULT 0'],
+    ['locked_rate_per_hour', 'REAL'],
+    ['closed_by_admin_id',   'INTEGER'],
+  ];
+  for (const [name, decl] of sessionAdds) {
+    if (!sessionCols.includes(name)) {
+      db.exec('ALTER TABLE sessions ADD COLUMN ' + name + ' ' + decl);
+      report.sessions_columns_added.push(name);
+    }
+  }
+
+  // ── S2. Partial UNIQUE INDEX on open sessions ───────────────────────
+  // Pre-assert Phase 1's invariant. If anyone bypassed Phase 1 and we
+  // have open sessions, the UNIQUE INDEX build could either silently
+  // succeed (one-row case) or fail with SQLITE_CONSTRAINT_UNIQUE (multi
+  // open per seat). Surface the misconfiguration explicitly instead.
+  const stillOpen = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE end_time IS NULL').get().c;
+  if (stillOpen > 0) {
+    throw new Error(
+      'billing-schema-v2: refusing to create idx_one_open_session_per_seat — ' +
+      stillOpen + ' open sessions still present. Phase 1 (prepBillingMigration) ' +
+      'must have closed all open sessions. Investigate before retrying.'
+    );
+  }
+  const hadIdx = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_one_open_session_per_seat'"
+  ).get();
+  if (!hadIdx) {
+    db.exec(
+      'CREATE UNIQUE INDEX idx_one_open_session_per_seat ' +
+      'ON sessions (computer_name, seat_slot) WHERE end_time IS NULL'
+    );
+    report.indexes_created.push('idx_one_open_session_per_seat');
+  }
+
+  // ── S3. credit_ledger + supporting indexes ──────────────────────────
+  // CHECK constraints encode the arithmetic invariant. credits/debt
+  // balances are reconstructible from this table alone:
+  //   users.credits == initial + Σ amount_credits  per user_id
+  // event_type is a CHECK enum — new types require a versioned migration.
+  // session_id FK to sessions(id) — currently metadata-only (PRAGMA
+  // foreign_keys is OFF on this DB); becomes enforced when FKs are
+  // globally enabled (planned Phase 6).
+  const hadLedger = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='credit_ledger'"
+  ).get();
+  if (!hadLedger) {
+    db.exec(`
+      CREATE TABLE credit_ledger (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id         INTEGER NOT NULL,
+        session_id      INTEGER REFERENCES sessions(id),
+        event_type      TEXT    NOT NULL CHECK (event_type IN (
+                          'tick','recharge','debt_pay','debt_add','shop',
+                          'manual_credit','manual_debit','reconciliation'
+                        )),
+        amount_credits  REAL    NOT NULL,
+        amount_debt     REAL    NOT NULL DEFAULT 0,
+        credits_before  REAL    NOT NULL,
+        credits_after   REAL    NOT NULL,
+        debt_before     REAL    NOT NULL,
+        debt_after      REAL    NOT NULL,
+        rate_per_hour   REAL,
+        multiplier      REAL,
+        tick_seconds    INTEGER,
+        admin_id        INTEGER,
+        description     TEXT,
+        created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CHECK (credits_before + amount_credits = credits_after),
+        CHECK (debt_before    + amount_debt    = debt_after),
+        CHECK (credits_after >= 0),
+        CHECK (debt_after    >= 0),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+    `);
+    report.tables_created.push('credit_ledger');
+  }
+  const ledgerIndexes = [
+    ['idx_credit_ledger_user_time',
+      'CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_time ON credit_ledger (user_id, created_at)'],
+    ['idx_credit_ledger_session',
+      'CREATE INDEX IF NOT EXISTS idx_credit_ledger_session ON credit_ledger (session_id) WHERE session_id IS NOT NULL'],
+    ['idx_credit_ledger_event_time',
+      'CREATE INDEX IF NOT EXISTS idx_credit_ledger_event_time ON credit_ledger (event_type, created_at)'],
+  ];
+  for (const [name, sql] of ledgerIndexes) {
+    const had = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?").get(name);
+    db.exec(sql);
+    if (!had) report.indexes_created.push(name);
+  }
+
+  // ── S4. credit_ledger append-only triggers + boot verification ──────
+  // Same pattern as audit_log_no_update / no_delete. Schema-layer
+  // enforcement that survives application bugs and operator typos.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS credit_ledger_no_update
+    BEFORE UPDATE ON credit_ledger
+    BEGIN
+      SELECT RAISE(ABORT, 'credit_ledger is append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS credit_ledger_no_delete
+    BEFORE DELETE ON credit_ledger
+    BEGIN
+      SELECT RAISE(ABORT, 'credit_ledger is append-only');
+    END;
+  `);
+  const wantTriggers = ['credit_ledger_no_update', 'credit_ledger_no_delete'];
+  const haveTriggers = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('credit_ledger_no_update','credit_ledger_no_delete')"
+  ).all().map(r => r.name);
+  const missingTriggers = wantTriggers.filter(t => !haveTriggers.includes(t));
+  if (missingTriggers.length) {
+    throw new Error(
+      'billing-schema-v2: credit_ledger append-only triggers missing after CREATE: ' +
+      missingTriggers.join(', ') + '. Refusing to continue.'
+    );
+  }
+  for (const t of wantTriggers) {
+    if (!report.triggers_created.includes(t)) report.triggers_created.push(t);
+  }
+
+  // ── S5. Rebuild users with CHECK constraints ────────────────────────
+  // SQLite cannot add a CHECK to an existing table. Use the canonical
+  // 12-step pattern. Guard by sqlite_master SQL probe so re-runs are
+  // no-ops once the rebuild has landed.
+  const usersSql = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+  ).get().sql || '';
+  const usersHasCheck = /CHECK\s*\(\s*credits\s*>=\s*0\s*\)/i.test(usersSql);
+  if (!usersHasCheck) {
+    // PRAGMA foreign_keys cannot be toggled inside a transaction; the
+    // canonical sequence is: disable FKs → BEGIN → swap → COMMIT → re-enable.
+    // We additionally run PRAGMA foreign_key_check inside the txn so any
+    // orphan in a child table (sessions/credit_transactions/shop_orders/
+    // client_assignments) blocks the COMMIT instead of silently surviving.
+    const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
+    db.pragma('foreign_keys = OFF');
+    let inTxn = false;
+    try {
+      const srcCount = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+      db.exec('BEGIN');
+      inTxn = true;
+      db.exec(`
+        CREATE TABLE users__new (
+          id               INTEGER PRIMARY KEY AUTOINCREMENT,
+          username         TEXT    UNIQUE NOT NULL,
+          password         TEXT    NOT NULL,
+          name             TEXT    DEFAULT '',
+          family           TEXT    DEFAULT '',
+          phone            TEXT    DEFAULT '',
+          is_active        INTEGER DEFAULT 1,
+          credits          REAL    NOT NULL DEFAULT 0 CHECK (credits >= 0),
+          total_minutes    INTEGER NOT NULL DEFAULT 0 CHECK (total_minutes >= 0),
+          total_spent      REAL    NOT NULL DEFAULT 0 CHECK (total_spent   >= 0),
+          debt             REAL    NOT NULL DEFAULT 0 CHECK (debt          >= 0),
+          debt_since       DATETIME,
+          discount_percent REAL    DEFAULT 0,
+          created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+          last_login       DATETIME,
+          limit_minutes    INTEGER DEFAULT 0,
+          allowed_seats    INTEGER DEFAULT 1,
+          post_pay         INTEGER DEFAULT 0,
+          limit_time       INTEGER DEFAULT 0
+        );
+      `);
+      db.exec(`
+        INSERT INTO users__new (
+          id, username, password, name, family, phone, is_active,
+          credits, total_minutes, total_spent, debt, debt_since,
+          discount_percent, created_at, last_login,
+          limit_minutes, allowed_seats, post_pay, limit_time
+        )
+        SELECT
+          id, username, password, name, family, phone, is_active,
+          credits,
+          COALESCE(total_minutes, 0),
+          COALESCE(total_spent,   0),
+          debt, debt_since,
+          discount_percent, created_at, last_login,
+          COALESCE(limit_minutes, 0),
+          COALESCE(allowed_seats, 1),
+          COALESCE(post_pay,      0),
+          COALESCE(limit_time,    0)
+        FROM users;
+      `);
+      const dstCount = db.prepare('SELECT COUNT(*) AS c FROM users__new').get().c;
+      if (dstCount !== srcCount) {
+        throw new Error(
+          'users rebuild row-count mismatch: src=' + srcCount + ' dst=' + dstCount
+        );
+      }
+      db.exec('DROP TABLE users');
+      db.exec('ALTER TABLE users__new RENAME TO users');
+      const fkProblems = db.prepare('PRAGMA foreign_key_check').all();
+      if (fkProblems.length) {
+        throw new Error(
+          'users rebuild produced FK orphans: ' + JSON.stringify(fkProblems)
+        );
+      }
+      db.exec('COMMIT');
+      inTxn = false;
+      report.users_rebuilt = true;
+      report.users_rebuilt_rows = dstCount;
+    } catch (e) {
+      if (inTxn) {
+        try { db.exec('ROLLBACK'); } catch (_) { /* already rolled */ }
+      }
+      throw e;
+    } finally {
+      // Restore the prior FK state regardless of success/failure.
+      if (fkWasOn) db.pragma('foreign_keys = ON');
+    }
+  }
+
+  // ── S6. Settings ────────────────────────────────────────────────────
+  const settingDefaults = [
+    ['billing_engine_version',         '2'],
+    ['billing_recovery_grace_seconds', '120'],
+    ['billing_kiosk_lockout_level',    'medium'],
+    ['billing_clock_warp_tolerance_s', '60'],
+  ];
+  const upsert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  for (const [k, v] of settingDefaults) {
+    const r = upsert.run(k, v);
+    if (r.changes === 1) report.settings_inserted.push(k);
+  }
+
+  // ── S7. Clock-warp boot probe ───────────────────────────────────────
+  // Spec: refuse to start if now < MAX(credit_ledger.created_at) +
+  // billing_clock_warp_tolerance_s. Catches both (a) restarting too
+  // soon after a tick (in-flight write race) and (b) system clock
+  // warped backward (would invalidate every credits/debt arithmetic
+  // invariant going forward).
+  //
+  // At Phase 2 boot the ledger is empty → MAX() is NULL → probe skips.
+  // The probe is "armed" from Phase 3 onward when tick rows begin.
+  const lastEventRow = db.prepare(
+    'SELECT MAX(created_at) AS t FROM credit_ledger'
+  ).get();
+  if (lastEventRow && lastEventRow.t) {
+    const tolRow = db.prepare("SELECT value FROM settings WHERE key = 'billing_clock_warp_tolerance_s'").get();
+    const toleranceS = Number((tolRow && tolRow.value) || 60);
+    // SQLite stores naive DATETIME in UTC; Date.parse on "YYYY-MM-DD HH:MM:SS"
+    // is browser-dependent. Force UTC interpretation by appending Z to the
+    // ISO-ish form ("YYYY-MM-DD HH:MM:SS" → "YYYY-MM-DDTHH:MM:SSZ").
+    const iso = String(lastEventRow.t).replace(' ', 'T') + 'Z';
+    const lastMs = Date.parse(iso);
+    if (!Number.isFinite(lastMs)) {
+      throw new Error('clock-warp probe: unparseable MAX(credit_ledger.created_at) = ' + lastEventRow.t);
+    }
+    const nowMs = Date.now();
+    const gapS = (nowMs - lastMs) / 1000;
+    if (gapS < toleranceS) {
+      throw new Error(
+        'clock-warp probe: refusing to start. now is only ' + gapS.toFixed(1) +
+        's after latest ledger event (' + lastEventRow.t + '); ' +
+        'tolerance = ' + toleranceS + 's. ' +
+        'Either wait ' + Math.ceil(toleranceS - gapS) + 's, or fix the system clock.'
+      );
+    }
+    report.clock_warp_probe = 'ok (gap ' + gapS.toFixed(1) + 's >= ' + toleranceS + 's)';
+  }
+
+  report.completed_at = new Date().toISOString();
+
+  const touched =
+    report.sessions_columns_added.length +
+    report.indexes_created.length +
+    report.tables_created.length +
+    report.triggers_created.filter(t => report.tables_created.includes('credit_ledger')).length +
+    (report.users_rebuilt ? 1 : 0) +
+    report.settings_inserted.length;
+  if (touched > 0 || report.users_rebuilt) {
+    console.log('🧱 [billing-schema-v2] applied — ' + JSON.stringify({
+      sessions_columns_added: report.sessions_columns_added,
+      indexes_created: report.indexes_created,
+      tables_created: report.tables_created,
+      users_rebuilt: report.users_rebuilt,
+      users_rebuilt_rows: report.users_rebuilt_rows,
+      settings_inserted: report.settings_inserted,
+      clock_warp_probe: report.clock_warp_probe,
+    }));
+  } else {
+    console.log('🧱 [billing-schema-v2] no-op (idempotent: schema already at v2)');
+  }
+  console.log('🛡  credit_ledger append-only triggers verified');
+
+  return report;
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2 };
