@@ -1,8 +1,28 @@
-const { app, BrowserWindow, ipcMain, shell, Menu, globalShortcut, screen, dialog, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Menu, globalShortcut, screen, dialog, powerSaveBlocker, crashReporter } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { exec, execFile } = require('child_process');
+const clientCrash = require('./crash-reporter');
+
+// ─── B2.2 — Electron native crash reporter ──────────────────────────
+// Captures V8 / GPU / child-process native crashes to
+// <userData>/Crashpad/pending/. Must be called before app.whenReady()
+// per Electron docs. submitURL is empty — we collect minidumps
+// locally; operator transfers via support tooling.
+try {
+  crashReporter.start({
+    productName: 'MuteGame',
+    companyName: 'MuteGame',
+    submitURL: '',           // local-only; no remote crash service
+    uploadToServer: false,
+    ignoreSystemCrashHandler: false,
+    extra: { kiosk_version: app.getVersion() || 'dev' },
+  });
+} catch (e) {
+  // Don't block startup on crashReporter init failures.
+  console.error('[crash-reporter] crashReporter.start failed:', e.message);
+}
 
 // ─── Network input validation ────────────────────────────────────────
 // Strict IPv4/IPv6 regexes. We use execFile (no shell) AND validate inputs
@@ -467,6 +487,35 @@ function createMainWindow() {
     if (!url.startsWith('http://localhost') && !url.startsWith('file://')) e.preventDefault();
   });
 
+  // ─── B2.2 — renderer crash capture ────────────────────────────
+  // Native renderer crash (V8 OOM, SEGV in a native module, GPU
+  // process gone, etc.). Records to disk + best-effort upload.
+  win.webContents.on('render-process-gone', (_e, details) => {
+    try {
+      clientCrash.record({
+        source: 'client_native',
+        message: 'render-process-gone: reason=' + (details && details.reason),
+        stack: '',
+        details: {
+          reason: details && details.reason,
+          exitCode: details && details.exitCode,
+        },
+      }).catch(() => {});
+    } catch (e) {
+      console.error('[crash-reporter] render-process-gone handler:', e.message);
+    }
+  });
+  win.webContents.on('unresponsive', () => {
+    try {
+      clientCrash.record({
+        source: 'client_native',
+        message: 'webContents unresponsive',
+        stack: '',
+        details: { kind: 'unresponsive' },
+      }).catch(() => {});
+    } catch (_) {}
+  });
+
   return win;
 }
 
@@ -643,6 +692,34 @@ function applyKioskLockdown() {
 }
 
 app.whenReady().then(() => {
+  // ─── B2.2 — initialize JS-side crash reporter ───────────────────
+  // userData is now available; wire local-dump directory + main-process
+  // handlers + IPC receiver for renderer crashes.
+  try {
+    clientCrash.init({
+      crashDir: path.join(app.getPath('userData'), 'MuteGame', 'crashes'),
+      userDataPath: app.getPath('userData'),
+      computerName: require('os').hostname(),
+      appVersion: app.getVersion() || null,
+      retention: 50,
+    });
+    clientCrash.installMainProcessHandlers({ exitOnCrash: false });
+    // Pull server URL from saved config (if any) to enable best-effort upload.
+    try {
+      const cfg = loadConfig();
+      if (cfg && cfg.serverUrl) clientCrash.setServerUrl(cfg.serverUrl);
+    } catch (_) {}
+    ipcMain.handle('crash-report-renderer', (_, payload) => {
+      return clientCrash.recordRendererCrash(payload || {});
+    });
+    ipcMain.handle('crash-set-server-url', (_, url) => {
+      clientCrash.setServerUrl(url || null);
+      return true;
+    });
+  } catch (e) {
+    console.error('[crash-reporter] init failed:', e.message);
+  }
+
   createAllWindows();
   registerLockdownShortcuts();
   startSleepBlock();

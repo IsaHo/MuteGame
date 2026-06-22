@@ -341,6 +341,9 @@ export default function App() {
 
     sock.on('connect', () => {
       setConnectError(null);
+      // B2.2 — point the crash uploader at the server we just connected
+      // to. Any subsequent renderer crash POSTs to /api/admin/crash-report.
+      try { ipc.setCrashServerUrl?.(cfg.serverUrl); } catch (_) {}
       sock.emit('client:register', { computerId: cfg.computerName, computerName: cfg.computerName });
 
       // Phase 4B — if the recovery reducer holds a session_uuid + user_id

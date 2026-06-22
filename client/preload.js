@@ -67,4 +67,11 @@ contextBridge.exposeInMainWorld('electron', {
   sessionSet: (payload) => ipcRenderer.invoke('session-set', payload),
   sessionClear: () => ipcRenderer.invoke('session-clear'),
   sessionKillActiveGame: () => ipcRenderer.invoke('session-kill-active-game'),
+
+  // ─── B2.2 — crash reporter (renderer → main bridge) ──────────────
+  // ErrorBoundary calls reportRendererCrash(); main persists locally
+  // + best-effort uploads to server. setCrashServerUrl wires the
+  // upload destination once the renderer has loaded its config.
+  reportRendererCrash: (payload) => ipcRenderer.invoke('crash-report-renderer', payload),
+  setCrashServerUrl: (url) => ipcRenderer.invoke('crash-set-server-url', url),
 });

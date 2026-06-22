@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const { initDatabase, getDb } = require('./database');
 const billing = require('./billing');
 const backup = require('./backup');
+const crashReporter = require('./crash-reporter');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const shopRoutes = require('./routes/shop');
@@ -34,6 +35,17 @@ app.use(cors());
 app.use(express.json());
 
 initDatabase();
+
+// ─── B2.2 — crash reporter (mirror of server/index.js) ──────────────
+crashReporter.installServerHandlers(getDb, {
+  getVersion: () => {
+    try { return require('./package.json').version; } catch (_) { return null; }
+  },
+});
+try {
+  const r = crashReporter.flushPendingAtBoot(getDb());
+  if (r.found > 0) console.log('💥 [crash-reporter] boot-flush', r);
+} catch (e) { console.error('crash-reporter boot-flush:', e.message); }
 
 const connectedClients = new Map();
 
@@ -107,6 +119,44 @@ app.post('/api/admin/backup', requireAdmin, requireAdminIp, async (req, res) => 
       }))();
     } catch (_) {}
     res.status(500).json({ error: e.code || 'backup_failed', message: e.message });
+  }
+});
+
+// ─── B2.2 — crash report ingestion + listing (mirror) ──────────────
+app.post('/api/admin/crash-report', (req, res) => {
+  const body = req.body || {};
+  if (!body.source || !crashReporter.VALID_SOURCES.has(body.source)) {
+    return res.status(400).json({ error: 'invalid_source' });
+  }
+  const ip = normalizeIp(req.ip);
+  const db = getDb();
+  try {
+    const r = crashReporter.recordCrash(db, {
+      source: body.source,
+      computer_name: String(body.computer_name || '').slice(0, 128),
+      version: String(body.version || '').slice(0, 64),
+      message: String(body.message || ''),
+      stack: String(body.stack || ''),
+      details: { ...(body.details || {}), admin_ip: ip },
+    });
+    res.json({ ok: true, dbOk: r.dbOk });
+  } catch (e) {
+    console.error('[crash-report]', e.stack || e.message);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+app.get('/api/admin/crashes', requireAdmin, requireAdminIp, (req, res) => {
+  const db = getDb();
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+  try {
+    const rows = db.prepare(
+      'SELECT id, source, computer_name, version, message, stack, details, created_at '
+      + 'FROM crash_log ORDER BY id DESC LIMIT ?'
+    ).all(limit);
+    res.json({ crashes: rows, count: rows.length });
+  } catch (e) {
+    res.status(500).json({ error: 'list_failed', message: e.message });
   }
 });
 

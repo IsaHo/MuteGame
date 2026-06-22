@@ -385,6 +385,10 @@ function initDatabase() {
     applyBillingMigrationPhase3(db);
   } catch (e) { console.error('billing-migration-phase3:', e.stack || e.message); throw e; }
 
+  try {
+    applyCrashLogSchema(db);
+  } catch (e) { console.error('crash-log-schema:', e.stack || e.message); throw e; }
+
   console.log('✅ Database ready');
 }
 
@@ -713,6 +717,9 @@ function applyBillingSchemaV2(db) {
     ['backup_last_status',               ''],
     ['backup_last_size_bytes',           '0'],
     ['backup_last_path',                 ''],
+    ['crash_dump_dir',                   './crashes'],
+    ['crash_dump_retention_count',       '50'],
+    ['crash_report_upload_url',          ''],
   ];
   const upsert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of settingDefaults) {
@@ -846,4 +853,43 @@ function applyBillingMigrationPhase3(db) {
   );
 }
 
-module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3 };
+/*
+ * B2.2 — append-only crash_log table + triggers. Mirror of server/database.js.
+ */
+function applyCrashLogSchema(db) {
+  const tableRow = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='crash_log'"
+  ).get();
+  if (tableRow) {
+    const wantTriggers = ['crash_log_no_update', 'crash_log_no_delete'];
+    const haveTriggers = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('crash_log_no_update','crash_log_no_delete')"
+    ).all().map(r => r.name);
+    const missing = wantTriggers.filter(t => !haveTriggers.includes(t));
+    if (missing.length) {
+      throw new Error('crash_log append-only triggers missing: ' + missing.join(', ') + '. Refusing to start.');
+    }
+    return { applied: false, reason: 'already_present' };
+  }
+  db.exec(
+    "CREATE TABLE crash_log ("
+    + "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    + "  source TEXT NOT NULL CHECK (source IN ('server','client_main','client_renderer','client_native')),"
+    + "  computer_name TEXT,"
+    + "  version TEXT,"
+    + "  message TEXT,"
+    + "  stack TEXT,"
+    + "  details TEXT,"
+    + "  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    + ");"
+    + "CREATE INDEX idx_crash_log_time ON crash_log (created_at);"
+    + "CREATE TRIGGER crash_log_no_update BEFORE UPDATE ON crash_log "
+    + "BEGIN SELECT RAISE(ABORT, 'crash_log is append-only'); END;"
+    + "CREATE TRIGGER crash_log_no_delete BEFORE DELETE ON crash_log "
+    + "BEGIN SELECT RAISE(ABORT, 'crash_log is append-only'); END;"
+  );
+  console.log('💥 [crash-log-schema] applied');
+  return { applied: true };
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema };
