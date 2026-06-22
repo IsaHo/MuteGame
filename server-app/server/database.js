@@ -702,6 +702,17 @@ function applyBillingSchemaV2(db) {
     ['billing_kiosk_lockout_level',      'medium'],
     ['billing_clock_warp_tolerance_s',   '60'],
     ['billing_resume_max_age_seconds',   '600'],
+    // B2.1 backup settings mirror.
+    ['backup_dest_primary',              './backups'],
+    ['backup_dest_secondary',            ''],
+    ['backup_schedule_hour',             '4'],
+    ['backup_retention_daily',           '14'],
+    ['backup_retention_weekly',          '8'],
+    ['backup_min_free_disk_ratio',       '2.0'],
+    ['backup_last_at',                   ''],
+    ['backup_last_status',               ''],
+    ['backup_last_size_bytes',           '0'],
+    ['backup_last_path',                 ''],
   ];
   const upsert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of settingDefaults) {

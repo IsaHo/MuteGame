@@ -5,6 +5,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { initDatabase, getDb } = require('./database');
 const billing = require('./billing');
+const backup = require('./backup');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const shopRoutes = require('./routes/shop');
@@ -88,6 +89,41 @@ app.get('/api/admin-ip', (req, res) => {
 
 app.get('/api/clients', (req, res) => {
   res.json(Array.from(connectedClients.values()));
+});
+
+// ─── B2.1 — backup endpoints (mirror of server/index.js) ───────────
+app.post('/api/admin/backup', requireAdmin, requireAdminIp, async (req, res) => {
+  const db = getDb();
+  try {
+    const r = await backup.performBackup(db, { tag: 'manual' });
+    db.transaction(() => audit(req, 'system.backup.manual', 'backup', null, {
+      path: r.path, size: r.size, integrity_ms: r.integrity_ms, secondary: r.secondary,
+    }))();
+    res.json({ ok: true, path: r.path, size: r.size, integrity: r.integrity, secondary: r.secondary });
+  } catch (e) {
+    try {
+      db.transaction(() => audit(req, 'system.backup.fail', 'backup', null, {
+        reason: e.code || 'unknown', message: e.message, details: e.details || {},
+      }))();
+    } catch (_) {}
+    res.status(500).json({ error: e.code || 'backup_failed', message: e.message });
+  }
+});
+
+app.get('/api/admin/backups', requireAdmin, requireAdminIp, (req, res) => {
+  const db = getDb();
+  try {
+    const dest = db.prepare("SELECT value FROM settings WHERE key='backup_dest_primary'").get();
+    const dir = (dest && dest.value) || './backups';
+    const r = backup.listBackups({ dest: dir });
+    res.json({
+      backups: r.map(b => ({ name: b.name, tag: b.tag, size: b.size, mtime_iso: b.mtime_iso })),
+      last_status: (db.prepare("SELECT value FROM settings WHERE key='backup_last_status'").get() || {}).value || '',
+      last_at: (db.prepare("SELECT value FROM settings WHERE key='backup_last_at'").get() || {}).value || '',
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'list_failed', message: e.message });
+  }
 });
 
 app.post('/api/clients/:socketId/kick', requireAdmin, requireAdminIp, (req, res) => {
@@ -782,6 +818,18 @@ function periodicRecoverySweep() {
 
 bootRecoverySweep();
 setInterval(periodicRecoverySweep, 30_000);
+
+// ─── B2.1 — backup scheduler (mirror of server/index.js) ───────────
+setInterval(() => {
+  const db = getDb();
+  try {
+    if (!backup.shouldRunScheduled(db)) return;
+  } catch (e) { console.error('[backup-scheduler] predicate:', e.message); return; }
+  const tag = backup.pickTag();
+  backup.performBackup(db, { tag })
+    .then(r => console.log('🗄  [backup-scheduler] ok', r.tag, r.path, 'size=' + r.size))
+    .catch(e => console.error('🗄  [backup-scheduler] FAIL', e.code || 'unknown', e.message));
+}, 60_000);
 
 // Global error middleware — must be LAST. A thrown handler (e.g. an audit
 // INSERT that rolled back the surrounding `db.transaction`) lands here and

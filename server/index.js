@@ -5,6 +5,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { initDatabase, getDb } = require('./database');
 const billing = require('./billing');
+const backup = require('./backup');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const shopRoutes = require('./routes/shop');
@@ -88,6 +89,48 @@ app.get('/api/admin-ip', (req, res) => {
 
 app.get('/api/clients', (req, res) => {
   res.json(Array.from(connectedClients.values()));
+});
+
+// ─── B2.1 — backup endpoints ───────────────────────────────────────
+// POST /api/admin/backup    — take a manual snapshot now. Tag is
+//                             'manual' so the file is distinguishable
+//                             from scheduled snapshots and is subject
+//                             to the daily retention budget.
+// GET  /api/admin/backups   — list snapshots in primary destination,
+//                             sorted newest-first. Operator UI uses
+//                             this to display recent backups + status.
+app.post('/api/admin/backup', requireAdmin, requireAdminIp, async (req, res) => {
+  const db = getDb();
+  try {
+    const r = await backup.performBackup(db, { tag: 'manual' });
+    db.transaction(() => audit(req, 'system.backup.manual', 'backup', null, {
+      path: r.path, size: r.size, integrity_ms: r.integrity_ms, secondary: r.secondary,
+    }))();
+    res.json({ ok: true, path: r.path, size: r.size, integrity: r.integrity, secondary: r.secondary });
+  } catch (e) {
+    try {
+      db.transaction(() => audit(req, 'system.backup.fail', 'backup', null, {
+        reason: e.code || 'unknown', message: e.message, details: e.details || {},
+      }))();
+    } catch (_) {}
+    res.status(500).json({ error: e.code || 'backup_failed', message: e.message });
+  }
+});
+
+app.get('/api/admin/backups', requireAdmin, requireAdminIp, (req, res) => {
+  const db = getDb();
+  try {
+    const dest = db.prepare("SELECT value FROM settings WHERE key='backup_dest_primary'").get();
+    const dir = (dest && dest.value) || './backups';
+    const r = backup.listBackups({ dest: dir });
+    res.json({
+      backups: r.map(b => ({ name: b.name, tag: b.tag, size: b.size, mtime_iso: b.mtime_iso })),
+      last_status: (db.prepare("SELECT value FROM settings WHERE key='backup_last_status'").get() || {}).value || '',
+      last_at: (db.prepare("SELECT value FROM settings WHERE key='backup_last_at'").get() || {}).value || '',
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'list_failed', message: e.message });
+  }
 });
 
 app.post('/api/clients/:socketId/kick', requireAdmin, requireAdminIp, (req, res) => {
@@ -890,6 +933,25 @@ function periodicRecoverySweep() {
 
 bootRecoverySweep();
 setInterval(periodicRecoverySweep, 30_000);
+
+// ─── B2.1 — backup scheduler ────────────────────────────────────────
+// Every 60s, check if (a) the current hour matches backup_schedule_hour
+// AND (b) the last successful backup is > 23h old. If so, take one.
+// Sunday backups land in weekly/ (with weekly retention); other days
+// land in daily/. Failures are logged loudly + recorded in
+// backup_last_status; the scheduler retries every minute until the
+// hour rolls over, so a transient failure (e.g. operator unplugged
+// the USB target) recovers naturally at the next minute boundary.
+setInterval(() => {
+  const db = getDb();
+  try {
+    if (!backup.shouldRunScheduled(db)) return;
+  } catch (e) { console.error('[backup-scheduler] predicate:', e.message); return; }
+  const tag = backup.pickTag();
+  backup.performBackup(db, { tag })
+    .then(r => console.log('🗄  [backup-scheduler] ok', r.tag, r.path, 'size=' + r.size))
+    .catch(e => console.error('🗄  [backup-scheduler] FAIL', e.code || 'unknown', e.message));
+}, 60_000);
 
 const adminDistPath = process.env.ADMIN_DIST || require('path').join(__dirname, '..', 'admin', 'dist');
 const fs = require('fs');

@@ -803,6 +803,22 @@ function applyBillingSchemaV2(db) {
     // recovery_max_age_exceeded and boot sweep closes them as
     // boot_recovery_age. Default: 10 minutes.
     ['billing_resume_max_age_seconds',   '600'],
+    // B2.1 — backup/restore engine settings. Daily snapshot at the
+    // scheduled hour (default 04:00 local); 14 daily + 8 weekly
+    // retention; min free disk ratio 2.0 (refuse if free < 2× DB size).
+    // backup_dest_primary is relative to server/ directory. Operator
+    // can set backup_dest_secondary to a USB / SMB / network path for
+    // off-machine copies.
+    ['backup_dest_primary',              './backups'],
+    ['backup_dest_secondary',            ''],
+    ['backup_schedule_hour',             '4'],
+    ['backup_retention_daily',           '14'],
+    ['backup_retention_weekly',          '8'],
+    ['backup_min_free_disk_ratio',       '2.0'],
+    ['backup_last_at',                   ''],
+    ['backup_last_status',               ''],
+    ['backup_last_size_bytes',           '0'],
+    ['backup_last_path',                 ''],
   ];
   const upsert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of settingDefaults) {
