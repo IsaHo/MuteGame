@@ -813,10 +813,32 @@ function bootRecoverySweep() {
   const cutoffIso = billing.isoNow(new Date(cutoffMs));
   const nowIso = billing.isoNow(new Date());
 
-  let young = 0, oldClosed = 0;
+  let young = 0, oldClosed = 0, invalidClosed = 0;
   for (const s of stale) {
+    // Parse last_billed_at defensively. parseDbTimestampMs throws on
+    // NULL or malformed input. Pre-Phase-2 closed rows can't reach
+    // here (WHERE end_time IS NULL excludes them) but a corrupted
+    // import or hand-edit could leave a NULL last_billed_at on an open
+    // session. Treat unparseable as "old": close defensively so the
+    // seat is freed. Operator can audit the closure via end_reason.
+    let lastMs;
     try {
-      const lastMs = billing.parseDbTimestampMs(s.last_billed_at);
+      lastMs = billing.parseDbTimestampMs(s.last_billed_at);
+    } catch (parseErr) {
+      console.error('[boot-recovery] unparseable last_billed_at on session', s.id, '=', s.last_billed_at, '— closing as boot_recovery_age');
+      try {
+        db.prepare(
+          "UPDATE sessions SET state='recovering' WHERE id=? AND end_time IS NULL AND state='active'"
+        ).run(s.id);
+        billing.closeSession(db, { session_id: s.id, end_reason: 'boot_recovery_age' });
+        invalidClosed++;
+      } catch (closeErr) {
+        console.error('[boot-recovery] invalid-row close error session', s.id, ':', closeErr.message);
+      }
+      continue;
+    }
+
+    try {
       if (lastMs >= cutoffMs) {
         // Young: eligible for resume. Transition to recovering + skip gap.
         db.prepare(
@@ -839,6 +861,7 @@ function bootRecoverySweep() {
   console.log(
     '🔄 [boot-recovery] young→recovering=' + young
     + ' old→closed=' + oldClosed
+    + ' invalid→closed=' + invalidClosed
     + ' (cutoff=' + maxAgeS + 's, total=' + stale.length + ')'
   );
 }

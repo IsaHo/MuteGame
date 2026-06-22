@@ -719,10 +719,27 @@ function bootRecoverySweep() {
   const cutoffMs = Date.now() - maxAgeS * 1000;
   const nowIso = billing.isoNow(new Date());
 
-  let young = 0, oldClosed = 0;
+  let young = 0, oldClosed = 0, invalidClosed = 0;
   for (const s of stale) {
+    // Defensive: NULL or malformed last_billed_at → close as boot_recovery_age.
+    let lastMs;
     try {
-      const lastMs = billing.parseDbTimestampMs(s.last_billed_at);
+      lastMs = billing.parseDbTimestampMs(s.last_billed_at);
+    } catch (parseErr) {
+      console.error('[boot-recovery] unparseable last_billed_at on session', s.id, '=', s.last_billed_at, '— closing as boot_recovery_age');
+      try {
+        db.prepare(
+          "UPDATE sessions SET state='recovering' WHERE id=? AND end_time IS NULL AND state='active'"
+        ).run(s.id);
+        billing.closeSession(db, { session_id: s.id, end_reason: 'boot_recovery_age' });
+        invalidClosed++;
+      } catch (closeErr) {
+        console.error('[boot-recovery] invalid-row close error session', s.id, ':', closeErr.message);
+      }
+      continue;
+    }
+
+    try {
       if (lastMs >= cutoffMs) {
         db.prepare(
           "UPDATE sessions SET state='recovering', last_billed_at=? WHERE id=? AND end_time IS NULL"
@@ -742,6 +759,7 @@ function bootRecoverySweep() {
   console.log(
     '🔄 [boot-recovery] young→recovering=' + young
     + ' old→closed=' + oldClosed
+    + ' invalid→closed=' + invalidClosed
     + ' (cutoff=' + maxAgeS + 's, total=' + stale.length + ')'
   );
 }
