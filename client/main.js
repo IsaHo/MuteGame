@@ -661,6 +661,56 @@ app.whenReady().then(() => {
   ipcMain.handle('save-config', (_, cfg) => { saveConfig(cfg); return true; });
   ipcMain.handle('get-computer-name', () => require('os').hostname());
 
+  // ─── Phase 4B — session persistence across renderer reload ─────────
+  // In-memory only (per Phase 4 design freeze). A renderer reload pulls
+  // the cached session and dispatches into the recovery state machine
+  // so the kiosk can emit client:resume on socket reconnect. A full
+  // Electron-main restart legitimately loses the cached session.
+  // session.set fires on session:started; session.clear fires on
+  // session:end / explicit logout. session.get returns null when no
+  // session is cached.
+  let cachedSession = null;
+  ipcMain.handle('session-get', () => cachedSession);
+  ipcMain.handle('session-set', (_, payload) => {
+    if (!payload || !payload.session_uuid || !payload.user_id) {
+      cachedSession = null;
+      return false;
+    }
+    cachedSession = {
+      session_uuid: String(payload.session_uuid),
+      user_id: Number(payload.user_id),
+      computer_name: String(payload.computer_name || ''),
+      locked_rate_per_hour: Number(payload.locked_rate_per_hour) || null,
+      // Stored timestamp for staleness display only — server enforces
+      // the max-age cap on resume.
+      stamped_at_ms: Date.now(),
+    };
+    return true;
+  });
+  ipcMain.handle('session-clear', () => { cachedSession = null; return true; });
+
+  // ─── Phase 4B — kill active game (HARD lockout escalation) ────────
+  // Called by the renderer when the state machine transitions to
+  // GRACE_HARD. Uses the existing endGameSession infrastructure to
+  // taskkill the active game process and emit game-session-end so the
+  // launcher overlay reappears.
+  ipcMain.handle('session-kill-active-game', () => {
+    try {
+      if (!activeGameExeName) return { ok: true, killed: false };
+      const exe = activeGameExeName;
+      if (!isValidExeName(exe)) return { ok: false, reason: 'invalid_exe' };
+      // taskkill /F /IM <exe> — argv form, no shell.
+      execFile('taskkill', ['/F', '/IM', exe], { timeout: 4000 }, (err) => {
+        if (err) console.warn('[hard-lockout] taskkill failed:', err.message);
+      });
+      // exitGameSession() restores kiosk window + clears state.
+      try { exitGameSession(); } catch (e) { console.warn('[hard-lockout] exitGameSession:', e.message); }
+      return { ok: true, killed: true, exe };
+    } catch (e) {
+      return { ok: false, reason: 'error', message: e.message };
+    }
+  });
+
   // Read the actual link speed of the active LAN adapter on Windows.
   // Returns a string like "1 Gbps" / "100 Mbps", or null on non-Windows.
   ipcMain.handle('get-link-speed', async () => {

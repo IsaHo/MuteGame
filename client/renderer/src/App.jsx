@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useReducer } from 'react';
 import { io } from 'socket.io-client';
 import Login from './Login';
 import Desktop from './Desktop';
@@ -8,6 +8,15 @@ import Loading from './Loading';
 import AdminPanel from './AdminPanel';
 import ToastStack, { toast } from './components/Toast';
 import AdminAuthModal from './components/AdminExitModal';
+import ReconnectOverlay from './ReconnectOverlay';
+import {
+  reducer as sessionReducer,
+  initial as sessionInitial,
+  SESSION_STATES,
+  isOverlayVisible,
+  canEmitResume,
+  shouldKillActiveGame,
+} from './sessionStateMachine';
 
 const ipc = window.electron || {
   getConfig: async () => ({ serverUrl: 'http://localhost:3001', computerName: 'PC-01' }),
@@ -31,6 +40,11 @@ const ipc = window.electron || {
   findGameExe: async () => ({ found: false }),
   launchGame: async () => ({ ok: false, error: 'IPC missing' }),
   applyClientAssignment: async () => ({ ok: false }),
+  // Phase 4B fallbacks — in-renderer-only (lost on reload).
+  sessionGet: async () => null,
+  sessionSet: async () => false,
+  sessionClear: async () => true,
+  sessionKillActiveGame: async () => ({ ok: true, killed: false }),
 };
 
 /* ─── Web Audio warning sounds ─────────────────────────────────────── */
@@ -175,6 +189,56 @@ export default function App() {
   const [connectError, setConnectError] = useState(null);
   const lastWarnedThreshold = useRef(null);
   const handleLoginRef = useRef(null);
+  const userRef = useRef(null);
+
+  // ─── Phase 4B — recovery state machine ─────────────────────────────
+  // Lives alongside the existing `state` (which tracks UI screens like
+  // 'loading'/'login'/'active'/'locked'/'config'). The recovery reducer
+  // adds GRACE_*/RECOVERING/RECOVERED on top. Overlay renders when the
+  // reducer says so; underlying screen stays mounted.
+  const [recovery, recoveryDispatch] = useReducer(sessionReducer, sessionInitial);
+  const recoveryRef = useRef(recovery);
+  useEffect(() => { recoveryRef.current = recovery; }, [recovery]);
+
+  // Grace-tick timer — drives GRACE_SOFT → GRACE_MEDIUM → GRACE_HARD
+  // escalation based on lockout_level. Cleaned up on state exit.
+  useEffect(() => {
+    const cur = recovery.state;
+    if (cur !== SESSION_STATES.GRACE_SOFT
+        && cur !== SESSION_STATES.GRACE_MEDIUM
+        && cur !== SESSION_STATES.GRACE_HARD) {
+      return undefined;
+    }
+    const startMs = recovery.disconnect_at || Date.now();
+    const tick = () => {
+      const elapsed = Math.floor((Date.now() - startMs) / 1000);
+      recoveryDispatch({ type: 'GRACE_TIMER', elapsed_seconds: elapsed });
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [recovery.state, recovery.disconnect_at]);
+
+  // RECOVERED is a flash state — auto-hide after 600ms.
+  useEffect(() => {
+    if (recovery.state !== SESSION_STATES.RECOVERED) return undefined;
+    const id = setTimeout(() => recoveryDispatch({ type: 'RECOVERED_HIDE' }), 600);
+    return () => clearTimeout(id);
+  }, [recovery.state]);
+
+  // Sync lockout level from server settings (already fetched into
+  // gameSettings on connect). Default 'medium'.
+  useEffect(() => {
+    const lvl = gameSettings.billing_kiosk_lockout_level || 'medium';
+    recoveryDispatch({ type: 'SET_LOCKOUT_LEVEL', level: lvl });
+  }, [gameSettings.billing_kiosk_lockout_level]);
+
+  // HARD lockout — kill active game via IPC.
+  useEffect(() => {
+    if (shouldKillActiveGame(recovery)) {
+      ipc.sessionKillActiveGame?.().catch(() => {});
+    }
+  }, [recovery.state]);
 
   const normalizeConfig = (cfg) => {
     if (!cfg) return cfg;
@@ -195,6 +259,25 @@ export default function App() {
         const need = await ipc.adminSetupRequired?.();
         if (need) { setSetupRequired(true); return; }
       } catch {}
+      // Phase 4B — pull any cached session from main BEFORE opening
+      // the socket, so the reducer enters the connect handler in a
+      // state where canEmitResume() returns true and the kiosk emits
+      // client:resume instead of bouncing to the login screen.
+      try {
+        const cached = await ipc.sessionGet?.();
+        if (cached && cached.session_uuid && cached.user_id) {
+          recoveryDispatch({ type: 'LOGIN_SUBMIT' });
+          recoveryDispatch({
+            type: 'SESSION_STARTED',
+            session_uuid: cached.session_uuid,
+            user_id: Number(cached.user_id),
+            locked_rate_per_hour: cached.locked_rate_per_hour,
+          });
+          // Treat mount as a disconnect — socket isn't connected yet.
+          recoveryDispatch({ type: 'DISCONNECTED', now_ms: Date.now() });
+        }
+      } catch (e) { /* ignore */ }
+
       ipc.getConfig().then(raw => {
         const cfg = normalizeConfig(raw);
         setConfig(cfg);
@@ -259,7 +342,23 @@ export default function App() {
     sock.on('connect', () => {
       setConnectError(null);
       sock.emit('client:register', { computerId: cfg.computerName, computerName: cfg.computerName });
-      setState('login');
+
+      // Phase 4B — if the recovery reducer holds a session_uuid + user_id
+      // from before disconnect, emit client:resume INSTEAD of forcing
+      // the login screen. The reducer's canEmitResume() returns true
+      // only when we have a uuid and we're in a recoverable state. On
+      // the first ever connect (no prior session), this is false and
+      // we fall to the regular login flow.
+      const rec = recoveryRef.current;
+      if (canEmitResume(rec)) {
+        recoveryDispatch({ type: 'RECONNECTING' });
+        sock.emit('client:resume', {
+          session_uuid: rec.session_uuid,
+          user_id: rec.user_id,
+        });
+      } else {
+        setState('login');
+      }
 
       fetch(`${cfg.serverUrl}/api/settings`).then(r => r.json()).then(s => setGameSettings(s)).catch(() => {});
       fetch(`${cfg.serverUrl}/api/shop/items`).then(r => r.json()).then(items => setShopItems(items.filter(i => i.active))).catch(() => {});
@@ -267,6 +366,85 @@ export default function App() {
         setServerGames(games);
         // Push to main so the launch allowlist includes hint_paths + exe_names
         try { window.electron?.updateAllowlist?.(games); } catch {}
+      }).catch(() => {});
+    });
+
+    // Phase 4B — socket-level disconnect handler. Transitions the
+    // recovery reducer to GRACE_SOFT (game keeps running, overlay
+    // shown). Doesn't reset the legacy `state`/`user`/`credits` — the
+    // ACTIVE UI stays mounted underneath the overlay so the customer's
+    // current activity is preserved.
+    sock.on('disconnect', () => {
+      const rec = recoveryRef.current;
+      if (rec.state === SESSION_STATES.ACTIVE) {
+        recoveryDispatch({ type: 'DISCONNECTED', now_ms: Date.now() });
+      }
+    });
+
+    // Phase 4B — server says "your session is restored". Refresh
+    // credits/debt cache and let the reducer transition RECOVERING →
+    // RECOVERED → ACTIVE (the RECOVERED state auto-hides after 600ms).
+    sock.on('resume:ok', (payload) => {
+      const { session_id, locked_rate_per_hour, credits: c, debt: d, post_pay } = payload || {};
+      recoveryDispatch({
+        type: 'RESUME_OK',
+        session_id, locked_rate_per_hour,
+        credits: c, debt: d, post_pay,
+      });
+      if (typeof c === 'number') setCredits(c);
+      if (typeof d === 'number') setDebt(d);
+      // Make sure the underlying UI is in ACTIVE; on a renderer-reload
+      // resume path the legacy state may still be 'loading'.
+      if (recoveryRef.current.user_id) setState('active');
+    });
+
+    // Phase 4B — server refused to resume. Reasons:
+    //   session_not_found / state_closed / wrong_computer / wrong_user /
+    //   recovery_max_age_exceeded / duplicate_client / invalid_payload.
+    // The reducer clears the session cache and counts strikes; after
+    // STRIKE_LIMIT rejections in STRIKE_WINDOW_MS it transitions to
+    // LOCKED so the operator gets called.
+    sock.on('resume:rejected', (payload) => {
+      const reason = (payload && payload.reason) || 'unknown';
+      recoveryDispatch({ type: 'RESUME_REJECTED', reason, now_ms: Date.now() });
+      ipc.sessionClear?.().catch(() => {});
+      setUser(null); setCredits(0); setDebt(0); setSessionStart(null);
+      if (recoveryRef.current.state === SESSION_STATES.LOCKED) {
+        setState('locked');
+      } else {
+        setState('login');
+      }
+      const map = {
+        session_not_found: 'نشست پیدا نشد — لطفاً دوباره وارد شوید',
+        state_closed: 'نشست بسته شده — ورود مجدد لازم است',
+        wrong_computer: 'این صندلی متعلق به سیستم دیگری است',
+        wrong_user: 'شناسه کاربر مطابقت ندارد',
+        recovery_max_age_exceeded: 'مدت بازیابی به پایان رسیده — ورود مجدد',
+        duplicate_client: 'این نشست توسط سیستم دیگری در حال استفاده است',
+      };
+      toast.danger(map[reason] || `بازیابی نشست ناموفق (${reason})`, 6000);
+    });
+
+    // Phase 4B — server confirms session started after client:login.
+    // Push uuid into both the reducer and the main-process cache so
+    // a renderer reload can recover it.
+    sock.on('session:started', (payload) => {
+      const { session_uuid, locked_rate_per_hour } = payload || {};
+      if (!session_uuid) return;
+      const rec = recoveryRef.current;
+      const u = userRef.current;
+      const userId = rec.user_id || (u && u.id) || null;
+      recoveryDispatch({
+        type: 'SESSION_STARTED',
+        session_uuid,
+        user_id: userId,
+        locked_rate_per_hour,
+      });
+      ipc.sessionSet?.({
+        session_uuid,
+        user_id: userId,
+        computer_name: cfg.computerName,
+        locked_rate_per_hour,
       }).catch(() => {});
     });
 
@@ -299,7 +477,13 @@ export default function App() {
       else if (reason === 'admin_kick') toast.danger('نشست توسط ادمین پایان یافت', 6000);
       else if (reason === 'account_disabled') toast.danger('حسابت غیرفعال شد', 6000);
       else if (reason === 'limit_reached') toast.danger(`لیمیت وقت (${limit||0} دقیقه) به اتمام رسید`, 6000);
-      sock.emit('client:logout');
+      else if (reason === 'session_gone') toast.danger('نشست توسط سیستم دیگری گرفته شد', 6000);
+      // Phase 4B — drive the reducer to LOCKED + clear the cached uuid.
+      recoveryDispatch({ type: reason === 'admin_kick' ? 'ADMIN_KICK' : 'SESSION_END', reason });
+      ipc.sessionClear?.().catch(() => {});
+      // logout signal to server is redundant (server already ended the
+      // session), but harmless if the socket is still alive.
+      try { sock.emit('client:logout'); } catch {}
       setUser(null); setCredits(0); setDebt(0); setSessionStart(null);
       setState('locked');
       ipc.lockScreen();
@@ -352,6 +536,10 @@ export default function App() {
         <div style="font-size:13px; opacity:.85; margin-bottom:6px;">پیام از مدیر گیم‌نت</div>
         <div style="font-size:18px; font-weight:700; line-height:1.7;">${(text||'').replace(/</g,'&lt;')}</div>
       `);
+      // Phase 4B — also surface the message inside the recovery
+      // overlay if the kiosk is currently in a GRACE_* / RECOVERING
+      // state (banner would be hidden under the overlay).
+      recoveryDispatch({ type: 'ADMIN_MESSAGE', text: text || '' });
       try { new Audio('data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAAAAAAAA').play().catch(()=>{}); } catch {}
     });
 
@@ -474,6 +662,17 @@ export default function App() {
     setState('active');
     ipc.unlockScreen();
 
+    // Phase 4B — seed reducer with user_id BEFORE session:started
+    // arrives so SESSION_STARTED has the user context. The reducer
+    // transitions IDLE → STARTING here; session:started flips it to
+    // ACTIVE with the uuid attached.
+    recoveryDispatch({ type: 'LOGIN_SUBMIT' });
+    // We pre-populate user_id via a synthetic SESSION_STARTED-less
+    // shim: store user_id on the reducer via the SESSION_STARTED path
+    // when it arrives. To make user_id available for canEmitResume
+    // even if SESSION_STARTED is delayed, we extend RECONNECTING to
+    // pull from recoveryRef; we already do that. No extra action here.
+
     if (socket) {
       socket.emit('client:login', {
         userId: userData.id,
@@ -488,6 +687,8 @@ export default function App() {
 
   // Keep a stable ref so socket listeners can call latest handleLogin
   useEffect(() => { handleLoginRef.current = handleLogin; }, [handleLogin]);
+  // Phase 4B — keep userRef fresh for socket-event closures.
+  useEffect(() => { userRef.current = user; }, [user]);
 
   const handleLogout = useCallback(() => {
     if (!user) return;
@@ -495,6 +696,9 @@ export default function App() {
     setUser(null); setCredits(0); setDebt(0); setSessionStart(null);
     setState('locked');
     ipc.lockScreen();
+    // Phase 4B — clear cached session + drive reducer to IDLE.
+    recoveryDispatch({ type: 'LOGOUT' });
+    ipc.sessionClear?.().catch(() => {});
   }, [user, socket]);
 
   const saveConfig = async (newCfg) => {
@@ -565,7 +769,28 @@ export default function App() {
           onLogout={handleLogout}
         />
       )}
-      {!setupRequired && state === 'locked' && <Locked onUnlock={() => setState('login')} />}
+      {!setupRequired && state === 'locked' && (
+        <Locked onUnlock={() => {
+          // Phase 4B — unlocking also resets the recovery reducer.
+          recoveryDispatch({ type: 'LOCK_UNLOCKED' });
+          setState('login');
+        }} />
+      )}
+
+      {/* Phase 4B — recovery overlay. Renders ABOVE the active session
+          UI during GRACE / RECOVERING / RECOVERED states so the
+          customer sees the connection status without losing their
+          session context. */}
+      {!setupRequired && isOverlayVisible(recovery) && (
+        <ReconnectOverlay
+          state={recovery.state}
+          gracElapsedS={recovery.grace_elapsed_s}
+          adminMessage={recovery.admin_message}
+          lockoutLevel={recovery.lockout_level}
+          onClearAdminMessage={() => recoveryDispatch({ type: 'CLEAR_ADMIN_MESSAGE' })}
+        />
+      )}
+
       <ToastStack />
 
       {showAuthModal && (

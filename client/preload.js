@@ -58,4 +58,13 @@ contextBridge.exposeInMainWorld('electron', {
   // ─── Limited task manager ─────────────────────────────────────────
   listProcesses: () => ipcRenderer.invoke('list-allowed-processes'),
   killProcess: (pid) => ipcRenderer.invoke('kill-process', pid),
+
+  // ─── Phase 4B — kiosk-recovery session cache + hard-lockout kill ──
+  // Session uuid persists in main-process memory only (per Phase 4
+  // design freeze — no disk storage). Survives a renderer reload;
+  // lost on Electron main restart.
+  sessionGet: () => ipcRenderer.invoke('session-get'),
+  sessionSet: (payload) => ipcRenderer.invoke('session-set', payload),
+  sessionClear: () => ipcRenderer.invoke('session-clear'),
+  sessionKillActiveGame: () => ipcRenderer.invoke('session-kill-active-game'),
 });
