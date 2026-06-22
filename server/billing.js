@@ -192,6 +192,34 @@ function _applyChargeLocked(db, {
   const c_before = u.credits;
   const d_before = u.debt;
 
+  // ── debt_add branch ─────────────────────────────────────────────────
+  // Pure debt accrual: credits untouched, debt += amount. Used for
+  // operator-entered debt (service-rendered-on-credit). total_spent is
+  // NOT bumped — debt_add is not customer spending. mode is irrelevant
+  // here (no credits → no shortfall path).
+  if (event_type === 'debt_add') {
+    const c_after = c_before;
+    const d_after = d_before + amount;
+    const upd = db.prepare(
+      'UPDATE users SET debt = ? WHERE id = ? AND credits = ? AND debt = ?'
+    ).run(d_after, user_id, c_before, d_before);
+    if (upd.changes !== 1) {
+      throw new DriftDetectedError(
+        'debt_add drift user=' + user_id + ' expected(c=' + c_before + ',d=' + d_before + ') changes=' + upd.changes
+      );
+    }
+    _writeLedgerRow(db, {
+      user_id, session_id, event_type,
+      credits_delta: 0, debt_delta: amount,
+      c_before, c_after, d_before, d_after,
+      rate_per_hour, multiplier, tick_seconds,
+      admin_id: ctx && ctx.admin_id,
+      description,
+    });
+    return { credits_delta: 0, debt_delta: amount, c_after, d_after, shortfall: 0 };
+  }
+
+  // ── credit-first charge branch (tick / shop / manual_debit) ─────────
   let credits_delta = 0;
   let debt_delta = 0;
   let shortfall = 0;

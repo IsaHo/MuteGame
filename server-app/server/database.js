@@ -380,6 +380,11 @@ function initDatabase() {
     applyBillingSchemaV2(db);
   } catch (e) { console.error('billing-schema-v2:', e.stack || e.message); throw e; }
 
+  // ─── Billing migration Phase 3 — mirror of server/database.js ────────
+  try {
+    applyBillingMigrationPhase3(db);
+  } catch (e) { console.error('billing-migration-phase3:', e.stack || e.message); throw e; }
+
   console.log('✅ Database ready');
 }
 
@@ -755,4 +760,78 @@ function applyBillingSchemaV2(db) {
   return report;
 }
 
-module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2 };
+/*
+ * Phase 3 (C3A) — credit_transactions migration bridge.
+ * Byte-for-byte mirror of server/database.js applyBillingMigrationPhase3.
+ */
+function applyBillingMigrationPhase3(db) {
+  const probe = (type, name) => db.prepare(
+    "SELECT name FROM sqlite_master WHERE type=? AND name=?"
+  ).get(type, name);
+
+  const has = {
+    legacyTable: !!probe('table', 'credit_transactions__legacy'),
+    view:        !!probe('view',  'credit_transactions'),
+    trigger:     !!probe('trigger', 'credit_transactions_insert_redirect'),
+    origTable:   !!probe('table', 'credit_transactions'),
+  };
+
+  if (has.legacyTable && has.view && has.trigger && !has.origTable) {
+    return { applied: false, reason: 'already_migrated' };
+  }
+  if (has.origTable && !has.legacyTable && !has.view && !has.trigger) {
+    const t0 = Date.now();
+    db.transaction(() => {
+      db.exec("ALTER TABLE credit_transactions RENAME TO credit_transactions__legacy");
+      db.exec(
+        "CREATE VIEW credit_transactions AS "
+        + "SELECT id, user_id, amount, type, description, created_at "
+        + "  FROM credit_transactions__legacy "
+        + "UNION ALL "
+        + "SELECT "
+        + "  -id AS id, "
+        + "  user_id, "
+        + "  CASE event_type "
+        + "    WHEN 'recharge'       THEN amount_credits + (-amount_debt) "
+        + "    WHEN 'tick'           THEN amount_credits "
+        + "    WHEN 'shop'           THEN amount_credits "
+        + "    WHEN 'debt_add'       THEN amount_debt "
+        + "    WHEN 'debt_pay'       THEN amount_debt "
+        + "    WHEN 'manual_credit'  THEN amount_credits "
+        + "    WHEN 'manual_debit'   THEN amount_credits "
+        + "    WHEN 'reconciliation' THEN amount_credits + amount_debt "
+        + "  END AS amount, "
+        + "  CASE event_type "
+        + "    WHEN 'recharge'       THEN 'charge' "
+        + "    WHEN 'tick'           THEN 'tick' "
+        + "    WHEN 'shop'           THEN 'shop' "
+        + "    WHEN 'debt_add'       THEN 'debt_add' "
+        + "    WHEN 'debt_pay'       THEN 'debt_pay' "
+        + "    WHEN 'manual_credit'  THEN 'free_gift' "
+        + "    WHEN 'manual_debit'   THEN 'decharge' "
+        + "    WHEN 'reconciliation' THEN 'reconciliation' "
+        + "  END AS type, "
+        + "  description, "
+        + "  created_at "
+        + "FROM credit_ledger"
+      );
+      db.exec(
+        "CREATE TRIGGER credit_transactions_insert_redirect "
+        + "INSTEAD OF INSERT ON credit_transactions "
+        + "BEGIN "
+        + "  INSERT INTO credit_transactions__legacy (user_id, amount, type, description, created_at) "
+        + "  VALUES (NEW.user_id, NEW.amount, NEW.type, NEW.description, COALESCE(NEW.created_at, CURRENT_TIMESTAMP)); "
+        + "END"
+      );
+    }).immediate();
+    const elapsed_ms = Date.now() - t0;
+    console.log('🌉 [billing-migration-phase3] applied in ' + elapsed_ms + 'ms');
+    return { applied: true, elapsed_ms };
+  }
+  throw new Error(
+    'partial credit_transactions migration detected: ' + JSON.stringify(has)
+    + ' — refusing to start. Investigate sqlite_master before retry.'
+  );
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3 };
