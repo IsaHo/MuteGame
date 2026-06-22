@@ -598,14 +598,19 @@ setInterval(() => {
     ).get(client.userId);
     if (!user) return;
     const sess = db.prepare('SELECT * FROM sessions WHERE id = ?').get(client.sessionId);
-    if (!sess) {
-      // Out-of-band close (boot sweep, recovery sweep, force-login from another path).
-      // Drop the cached session and idle the client; next login starts clean.
+    if (!sess || sess.state === 'closed') {
+      // Out-of-band close: the cached session row was either deleted
+      // (shouldn't happen — append-only enforced elsewhere) or was
+      // closed by force-login / kick / boot-recovery / recovery-sweep
+      // while this kiosk was still showing the logged-in UI. Surface
+      // the eviction so the kiosk locks instead of sitting un-billed
+      // with stale UI. The DB session is already closed; nothing
+      // further to charge.
       evictClient(client, socketId, 'session_gone');
       io.emit('clients:update', Array.from(connectedClients.values()));
       return;
     }
-    if (sess.state !== 'active') return;  // recovering / starting / closed → skip
+    if (sess.state !== 'active') return;  // recovering / starting → skip (intentional)
 
     // limit_time = unlimited free play. Bump last_billed_at + duration so
     // the recovery sweep doesn't see this row as stale and aggregate

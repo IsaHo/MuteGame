@@ -547,7 +547,7 @@ setInterval(() => {
     ).get(client.userId);
     if (!user) return;
     const sess = db.prepare('SELECT * FROM sessions WHERE id = ?').get(client.sessionId);
-    if (!sess) {
+    if (!sess || sess.state === 'closed') {
       evictClient(client, socketId, 'session_gone');
       io.emit('clients:update', Array.from(connectedClients.values()));
       return;
