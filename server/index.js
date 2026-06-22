@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { initDatabase, getDb } = require('./database');
+const billing = require('./billing');
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const shopRoutes = require('./routes/shop');
@@ -93,9 +94,14 @@ app.post('/api/clients/:socketId/kick', requireAdmin, requireAdminIp, (req, res)
   const client = connectedClients.get(req.params.socketId);
   const db = getDb();
   const targetUserId = client?.userId || null;
+  const targetSessionId = client?.sessionId || null;
   db.transaction(() => {
-    if (client && client.userId) {
-      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(client.userId);
+    if (targetSessionId) {
+      billing.closeSession(db, {
+        session_id: targetSessionId,
+        end_reason: 'admin_force_logout',
+        ctx: { admin_id: req.admin && req.admin.id },
+      });
     }
     audit(req, 'client.kick', 'client', req.params.socketId, { userId: targetUserId, computerName: client?.computerName });
   })();
@@ -105,6 +111,8 @@ app.post('/api/clients/:socketId/kick', requireAdmin, requireAdminIp, (req, res)
     client.credits = 0;
     client.status = 'idle';
     client.sessionStart = null;
+    client.sessionId = null;
+    client.sessionUuid = null;
     io.to(req.params.socketId).emit('session:end', { reason: 'admin_kick' });
     io.emit('clients:update', Array.from(connectedClients.values()));
   }
@@ -121,18 +129,28 @@ app.post('/api/clients/:socketId/message', requireAdmin, requireAdminIp, (req, r
 });
 
 app.post('/api/clients/:socketId/extend', requireAdmin, requireAdminIp, (req, res) => {
-  const { minutes } = req.body;
+  const amount = Number(req.body.minutes);
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'مقدار نامعتبر' });
   const client = Array.from(connectedClients.values()).find(c => c.socketId === req.params.socketId);
   if (client && client.userId) {
     const db = getDb();
-    let user;
+    let result;
     db.transaction(() => {
-      db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(minutes, client.userId);
-      audit(req, 'client.extend', 'user', client.userId, { socketId: req.params.socketId, computerName: client.computerName, minutes: Number(minutes) });
-      user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(client.userId);
+      // creditUser is the ONLY allowed balance-write path. 'manual_credit'
+      // semantics: credits += amount; no debt adjustment. Admin-extending
+      // an active session is a gift, not a debt payment.
+      result = billing.creditUser(db, {
+        user_id: client.userId,
+        amount,
+        event_type: 'manual_credit',
+        description: 'admin extend (' + amount + ' units) socket=' + req.params.socketId,
+        ctx: { admin_id: req.admin && req.admin.id },
+      });
+      audit(req, 'client.extend', 'user', client.userId, { socketId: req.params.socketId, computerName: client.computerName, minutes: amount });
     })();
-    client.credits = user.credits;
-    io.to(req.params.socketId).emit('credits:update', { credits: user.credits, debt: user.debt });
+    client.credits = result.credits_after;
+    client.debt = result.debt_after;
+    io.to(req.params.socketId).emit('credits:update', { credits: result.credits_after, debt: result.debt_after });
     io.emit('clients:update', Array.from(connectedClients.values()));
   }
   res.json({ success: true });
@@ -140,27 +158,51 @@ app.post('/api/clients/:socketId/extend', requireAdmin, requireAdminIp, (req, re
 
 // ─── Force-login a user on a specific PC (admin context-menu) ───────
 app.post('/api/clients/:socketId/force-login', requireAdmin, requireAdminIp, (req, res) => {
-  const { userId, username, credits } = req.body;
+  const { userId, username } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId لازم است' });
   const client = connectedClients.get(req.params.socketId);
   if (!client) return res.status(404).json({ error: 'PC پیدا نشد' });
   const db = getDb();
-  let user;
-  db.transaction(() => {
-    // Close any open session for this user, then start a new one on this PC
-    db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(userId);
-    db.prepare('INSERT INTO sessions (user_id, computer_name) VALUES (?, ?)').run(userId, client.computerName);
-    db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
-    audit(req, 'client.force-login', 'user', userId, { socketId: req.params.socketId, computerName: client.computerName, username });
-    user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-  })();
-  client.userId = userId;
+  let user, opened;
+  const adminCtx = { admin_id: req.admin && req.admin.id };
+  try {
+    db.transaction(() => {
+      // 1. Close any session currently open on this seat (regardless of user)
+      //    so openSession's partial UNIQUE INDEX won't reject the new one.
+      const seatHolders = db.prepare(
+        "SELECT id FROM sessions WHERE computer_name = ? AND seat_slot = 0 AND end_time IS NULL"
+      ).all(client.computerName);
+      for (const r of seatHolders) {
+        billing.closeSession(db, { session_id: r.id, end_reason: 'force_login_displace', ctx: adminCtx });
+      }
+      // 2. Close any session this user has on OTHER PCs (user displaced from elsewhere).
+      const userElsewhere = db.prepare(
+        "SELECT id FROM sessions WHERE user_id = ? AND end_time IS NULL"
+      ).all(userId);
+      for (const r of userElsewhere) {
+        billing.closeSession(db, { session_id: r.id, end_reason: 'force_login_displace', ctx: adminCtx });
+      }
+      // 3. Open the new session on this seat for the target user.
+      opened = billing.openSession(db, {
+        user_id: Number(userId), computer_name: client.computerName, seat_slot: 0, ctx: adminCtx,
+      });
+      db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
+      audit(req, 'client.force-login', 'user', userId, { socketId: req.params.socketId, computerName: client.computerName, username, session_id: opened.session_id });
+      user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    }).immediate();
+  } catch (e) {
+    console.error('[force-login]', e.stack || e.message);
+    return res.status(500).json({ error: e.code === 'SEAT_BUSY' ? 'صندلی قابل آزاد شدن نیست' : 'خطا در شروع نشست' });
+  }
+  client.userId = Number(userId);
   client.username = username || user.username;
   client.credits = user.credits;
   client.debt    = user.debt;
   client.postPay = user.post_pay ? 1 : 0;
   client.status = 'active';
   client.sessionStart = new Date().toISOString();
+  client.sessionId = opened.session_id;
+  client.sessionUuid = opened.session_uuid;
   // Tell the client to log in this user
   io.to(req.params.socketId).emit('admin:force-login', {
     user: { id: user.id, username: user.username, name: user.name, family: user.family, credits: user.credits, debt: user.debt },
@@ -330,6 +372,8 @@ io.on('connection', (socket) => {
       userId: null,
       username: null,
       sessionStart: null,
+      sessionId: null,
+      sessionUuid: null,
       credits: 0,
       debt: 0,
       postPay: 0,
@@ -384,40 +428,78 @@ io.on('connection', (socket) => {
   socket.on('client:login', (data) => {
     const client = connectedClients.get(socket.id);
     if (!client) return;
+    if (!Number.isInteger(Number(data.userId))) {
+      socket.emit('login:error', { message: 'userId نامعتبر' });
+      return;
+    }
+    const userId = Number(data.userId);
     const db = getDb();
 
-    db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(data.userId);
-    db.prepare('INSERT INTO sessions (user_id, computer_name) VALUES (?, ?)').run(data.userId, client.computerName);
-    db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(data.userId);
+    let opened;
+    try {
+      db.transaction(() => {
+        // Displace any prior session this user has open elsewhere (kiosk
+        // crash recovery: user re-logs on a different PC). Same user on
+        // same seat would also be caught by openSession's SeatBusyError;
+        // closing upstream gives a clean ledger transition.
+        const userElsewhere = db.prepare(
+          "SELECT id FROM sessions WHERE user_id = ? AND end_time IS NULL"
+        ).all(userId);
+        for (const r of userElsewhere) {
+          billing.closeSession(db, { session_id: r.id, end_reason: 'force_login_displace' });
+        }
+        opened = billing.openSession(db, {
+          user_id: userId, computer_name: client.computerName, seat_slot: 0,
+        });
+        db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
+      }).immediate();
+    } catch (e) {
+      console.error('[client:login]', e.stack || e.message);
+      socket.emit('login:error', {
+        message: e.code === 'SEAT_BUSY' ? 'این صندلی در حال استفاده است' : 'خطا در شروع نشست',
+        code: e.code || null,
+      });
+      return;
+    }
 
-    // Always read debt + post_pay from DB — the kiosk only sends credits
-    // because that's what the user sees on its login screen. Admin needs the
-    // full financial picture (debt badge, post-pay flag) at login time, not
-    // a tick later.
-    const u = db.prepare('SELECT debt, post_pay FROM users WHERE id = ?').get(data.userId) || {};
+    // Always read credits + debt + post_pay from DB — the kiosk's `data`
+    // payload is just what the login screen saw, not authoritative.
+    const u = db.prepare('SELECT credits, debt, post_pay FROM users WHERE id = ?').get(userId) || {};
 
-    client.userId = data.userId;
+    client.userId = userId;
     client.username = data.username;
-    client.credits = data.credits;
+    client.credits = Number(u.credits || 0);
     client.debt = Number(u.debt || 0);
     client.postPay = u.post_pay ? 1 : 0;
     client.status = 'active';
     client.sessionStart = new Date().toISOString();
+    client.sessionId = opened.session_id;
+    client.sessionUuid = opened.session_uuid;
+    socket.emit('session:started', {
+      session_uuid: opened.session_uuid,
+      locked_rate_per_hour: opened.locked_rate_per_hour,
+    });
     io.emit('clients:update', Array.from(connectedClients.values()));
   });
 
   socket.on('client:logout', () => {
     const client = connectedClients.get(socket.id);
     if (!client) return;
-    if (client.userId) {
+    if (client.sessionId) {
       const db = getDb();
-      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(client.userId);
+      try {
+        billing.closeSession(db, { session_id: client.sessionId, end_reason: 'user_logout' });
+      } catch (e) {
+        console.error('[client:logout]', e.stack || e.message);
+      }
     }
     client.userId = null;
     client.username = null;
     client.credits = 0;
     client.status = 'idle';
     client.sessionStart = null;
+    client.sessionId = null;
+    client.sessionUuid = null;
     io.emit('clients:update', Array.from(connectedClients.values()));
   });
 
@@ -455,9 +537,19 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     const client = connectedClients.get(socket.id);
-    if (client?.userId) {
+    if (client?.sessionId) {
+      // Transition active → recovering. Pauses billing for this session
+      // until either (a) the same user re-logs (next client:login closes
+      // it with end_reason='force_login_displace' and opens a fresh
+      // session), or (b) the periodic recovery sweep closes it after
+      // billing_recovery_grace_seconds (end_reason='recovery_timeout').
+      // The unpaid_micros fraction is preserved on the row in case
+      // Phase 4 resume protocol arrives — for now it's lost when the
+      // session is closed (≤ 1 unit per disconnect, acceptable).
       const db = getDb();
-      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(client.userId);
+      try {
+        db.prepare("UPDATE sessions SET state = 'recovering' WHERE id = ? AND state = 'active'").run(client.sessionId);
+      } catch (e) { console.error('[disconnect] mark-recovering error:', e.message); }
     }
     connectedClients.delete(socket.id);
     io.emit('clients:update', Array.from(connectedClients.values()));
@@ -465,98 +557,183 @@ io.on('connection', (socket) => {
   });
 });
 
-// Credit deduction: Rial-based per minute
+// ─── Timestamp-driven billing ticker (Phase 3) ──────────────────────
+// Replaces the ceil-per-minute deduction with the freeze v1 model:
+//   • Each active session has its own last_billed_at + unpaid_micros.
+//   • Every tick advances the timestamp, accumulates micro-currency owed
+//     at the session's locked_rate_per_hour, flushes whole units to the
+//     user, and persists the fractional remainder.
+//   • All mutation goes through billing.billSessionUntilLocked inside a
+//     BEGIN IMMEDIATE transaction. The ticker never touches users.credits
+//     or sessions.* directly — the forbidden-direct-writes rule applies.
+//   • shortfall>0 + !post_pay → close with end_reason='no_funds' + evict.
+//   • limit_time = unlimited free play: advance last_billed_at without
+//     charge or ledger row (no billing happens).
+//   • limit_minutes (per-session cap): when sessions.duration >= cap,
+//     close with end_reason='session_expired'.
+function evictClient(client, socketId, reason, extra = {}) {
+  io.to(socketId).emit('session:end', { reason, ...extra });
+  client.status = 'idle';
+  client.userId = null;
+  client.username = null;
+  client.credits = 0;
+  client.sessionStart = null;
+  client.sessionId = null;
+  client.sessionUuid = null;
+}
+
 setInterval(() => {
   const db = getDb();
-  const settings = Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map(r => [r.key, r.value]));
-  const pricePerHour = Number(settings.gaming_price_per_hour || 30000);
-  const peakStart = Number(settings.gaming_peak_start || 16);
-  const peakEnd = Number(settings.gaming_peak_end || 24);
-  const offStart = Number(settings.gaming_offpeak_start || 0);
-  const offEnd = Number(settings.gaming_offpeak_end || 12);
-  const multiplier = (() => {
-    const h = new Date().getHours();
-    if (h >= peakStart && h < peakEnd) return Number(settings.gaming_peak_multiplier || 1);
-    if (h >= offStart && h < offEnd) return Number(settings.gaming_offpeak_multiplier || 1);
-    return 1;
+  const lowThreshold = (() => {
+    const r = db.prepare("SELECT value FROM settings WHERE key = 'gaming_price_per_hour'").get();
+    return Number((r && r.value) || 30000);
   })();
-  const deductAmount = Math.ceil(pricePerHour * multiplier / 60);
-  const lowThreshold = pricePerHour; // warn when < 1 hour remaining
+  const now = new Date();
 
   connectedClients.forEach((client, socketId) => {
-    if (client.status !== 'active' || !client.userId) return;
+    if (client.status !== 'active' || !client.userId || !client.sessionId) return;
 
-    const user = db.prepare('SELECT credits, debt, limit_minutes, allowed_seats, post_pay, limit_time FROM users WHERE id = ?').get(client.userId);
+    const user = db.prepare(
+      'SELECT id, credits, debt, limit_minutes, post_pay, limit_time FROM users WHERE id = ?'
+    ).get(client.userId);
     if (!user) return;
+    const sess = db.prepare('SELECT * FROM sessions WHERE id = ?').get(client.sessionId);
+    if (!sess) {
+      // Out-of-band close (boot sweep, recovery sweep, force-login from another path).
+      // Drop the cached session and idle the client; next login starts clean.
+      evictClient(client, socketId, 'session_gone');
+      io.emit('clients:update', Array.from(connectedClients.values()));
+      return;
+    }
+    if (sess.state !== 'active') return;  // recovering / starting / closed → skip
 
-    // limit_time = unlimited free play. Just bump the session counter and
-    // notify the client that nothing changed — no deduction, no credit check,
-    // no time-cap enforcement.
+    // limit_time = unlimited free play. Bump last_billed_at + duration so
+    // the recovery sweep doesn't see this row as stale and aggregate
+    // reports still show wall-clock time, but emit no ledger row and
+    // touch no balance.
     if (user.limit_time) {
-      db.prepare('UPDATE users SET total_minutes = total_minutes + 1 WHERE id = ?').run(client.userId);
-      db.prepare('UPDATE sessions SET duration = duration + 1 WHERE user_id = ? AND end_time IS NULL').run(client.userId);
-      // We still notify the client so its UI ticks; credits/debt don't change.
+      try {
+        const lastMs = billing.parseDbTimestampMs(sess.last_billed_at);
+        const deltaSec = Math.max(0, Math.floor((now.getTime() - lastMs) / 1000));
+        if (deltaSec > 0) {
+          db.transaction(() => {
+            db.prepare(
+              'UPDATE sessions SET last_billed_at = ?, duration = duration + ? WHERE id = ? AND state = \'active\''
+            ).run(billing.isoNow(now), deltaSec, sess.id);
+            db.prepare('UPDATE users SET total_minutes = total_minutes + ? WHERE id = ?')
+              .run(Math.floor(deltaSec / 60), user.id);
+          }).immediate();
+        }
+      } catch (e) { console.error('[ticker:limit_time] error session', sess.id, ':', e.message); }
       io.to(socketId).emit('credits:update', { credits: 0, debt: user.debt, limit_time: 1 });
       return;
     }
 
-    // Enforce per-session time limit (limit_minutes = 0 → unlimited)
-    const sess = db.prepare('SELECT duration FROM sessions WHERE user_id = ? AND end_time IS NULL').get(client.userId);
-    if (user.limit_minutes > 0 && sess && sess.duration >= user.limit_minutes) {
-      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL').run(client.userId);
-      io.to(socketId).emit('session:end', { reason: 'limit_reached', limit: user.limit_minutes });
-      client.status = 'idle'; client.userId = null; client.username = null;
-      client.credits = 0; client.sessionStart = null;
+    // Per-session minute cap. Convert to seconds — sessions.duration is
+    // tracked in seconds since Phase 3 (was per-minute increments before).
+    if (user.limit_minutes > 0 && sess.duration >= user.limit_minutes * 60) {
+      try {
+        billing.closeSession(db, { session_id: sess.id, end_reason: 'session_expired', now });
+      } catch (e) { console.error('[ticker:limit_minutes] close error session', sess.id, ':', e.message); }
+      evictClient(client, socketId, 'limit_reached', { limit: user.limit_minutes });
       io.emit('clients:update', Array.from(connectedClients.values()));
       return;
     }
 
-    // Split credit consumption equally if multi-seat (allowed_seats > 1):
-    // count concurrent active sessions for this user, divide deduction.
-    let activeSeatCount = 1;
-    if ((user.allowed_seats || 1) > 1) {
-      activeSeatCount = Array.from(connectedClients.values())
-        .filter(c => c.status === 'active' && c.userId === client.userId).length || 1;
+    // Standard timestamp-driven tick.
+    let result;
+    try {
+      result = db.transaction(() => billing.billSessionUntilLocked(db, sess, now, {})).immediate();
+    } catch (e) {
+      // Drift, clock warp, or unexpected schema/constraint error. Skip
+      // this tick — next tick retries. Loud log for ops.
+      console.error('[ticker:bill] error session', sess.id, ':', e.message);
+      return;
     }
-    const perPcDeduct = Math.ceil(deductAmount / activeSeatCount);
 
-    const canPay = user.credits >= perPcDeduct;
-    if (canPay || user.post_pay) {
-      db.prepare('UPDATE users SET credits = credits - ?, total_minutes = total_minutes + 1 WHERE id = ?')
-        .run(perPcDeduct, client.userId);
-      // If post-pay and credits went negative, accumulate debt
-      if (!canPay && user.post_pay) {
-        const overdraft = perPcDeduct - Math.max(0, user.credits);
-        db.prepare(`UPDATE users SET debt = debt + ?,
-          debt_since = COALESCE(debt_since, CURRENT_TIMESTAMP) WHERE id = ?`)
-          .run(overdraft, client.userId);
-      }
-      db.prepare('UPDATE sessions SET duration = duration + 1 WHERE user_id = ? AND end_time IS NULL')
-        .run(client.userId);
-      const refreshed = db.prepare('SELECT credits, debt, post_pay FROM users WHERE id = ?').get(client.userId);
+    // Refresh user state for the connectedClients cache + admin UI.
+    const refreshed = db.prepare('SELECT credits, debt, post_pay FROM users WHERE id = ?').get(user.id);
+    if (refreshed) {
       client.credits = refreshed.credits;
-      client.debt    = refreshed.debt;
+      client.debt = refreshed.debt;
       client.postPay = refreshed.post_pay ? 1 : 0;
-      io.to(socketId).emit('credits:update', { credits: refreshed.credits, debt: refreshed.debt });
+    }
 
-      if (refreshed.credits <= lowThreshold && refreshed.credits > 0) {
-        io.to(socketId).emit('credits:low', { credits: refreshed.credits });
-      }
+    // Insufficient funds + no post_pay → close + evict. The partial-mode
+    // tick already drained any remaining credits before reporting the
+    // shortfall, so closeSession's final flush is a no-op here.
+    if (result.shortfall > 0 && !user.post_pay) {
+      try {
+        billing.closeSession(db, { session_id: sess.id, end_reason: 'no_funds', now });
+      } catch (e) { console.error('[ticker:no_funds] close error session', sess.id, ':', e.message); }
+      evictClient(client, socketId, 'no_credits');
+      io.emit('clients:update', Array.from(connectedClients.values()));
+      return;
+    }
 
-      io.emit('clients:update', Array.from(connectedClients.values()));
-    } else {
-      db.prepare('UPDATE sessions SET end_time = CURRENT_TIMESTAMP WHERE user_id = ? AND end_time IS NULL')
-        .run(client.userId);
-      io.to(socketId).emit('session:end', { reason: 'no_credits' });
-      client.status = 'idle';
-      client.userId = null;
-      client.username = null;
-      client.credits = 0;
-      client.sessionStart = null;
-      io.emit('clients:update', Array.from(connectedClients.values()));
+    io.to(socketId).emit('credits:update', {
+      credits: refreshed ? refreshed.credits : 0,
+      debt: refreshed ? refreshed.debt : 0,
+    });
+    if (refreshed && refreshed.credits > 0 && refreshed.credits <= lowThreshold) {
+      io.to(socketId).emit('credits:low', { credits: refreshed.credits });
     }
   });
+  io.emit('clients:update', Array.from(connectedClients.values()));
 }, 60000);
+
+// ─── Boot recovery sweep (Phase 3) ──────────────────────────────────
+// On boot, every session with end_time IS NULL is from the previous
+// boot — the process either crashed or was shut down without logout.
+// Mark each as 'recovering' first so closeSession's final flush sees
+// state='recovering' and SKIPS billing (the crash → boot gap is
+// un-billable: the customer wasn't playing during downtime). Then
+// close with end_reason='boot_recovery'. Idempotent: on a clean DB
+// the sweep finds zero rows and is a no-op.
+function bootRecoverySweep() {
+  const db = getDb();
+  const stale = db.prepare("SELECT id FROM sessions WHERE end_time IS NULL").all();
+  if (!stale.length) {
+    console.log('🔄 [boot-recovery] no stale sessions');
+    return;
+  }
+  db.prepare("UPDATE sessions SET state = 'recovering' WHERE end_time IS NULL AND state = 'active'").run();
+  let closed = 0;
+  for (const s of stale) {
+    try {
+      billing.closeSession(db, { session_id: s.id, end_reason: 'boot_recovery' });
+      closed++;
+    } catch (e) {
+      console.error('[boot-recovery] close error session', s.id, ':', e.message);
+    }
+  }
+  console.log('🔄 [boot-recovery] closed', closed, '/', stale.length, 'stale sessions');
+}
+
+// ─── Periodic recovery sweep (Phase 3) ──────────────────────────────
+// Every 30s: find sessions in state='recovering' whose last_billed_at
+// is older than billing_recovery_grace_seconds. These represent kiosks
+// that disconnected and never came back. Close with end_reason=
+// 'recovery_timeout' so the seat is freed (the partial UNIQUE INDEX
+// would otherwise block a new login on the same seat forever).
+function periodicRecoverySweep() {
+  const db = getDb();
+  const graceRow = db.prepare("SELECT value FROM settings WHERE key = 'billing_recovery_grace_seconds'").get();
+  const graceS = Number((graceRow && graceRow.value) || 120);
+  const cutoffIso = billing.isoNow(new Date(Date.now() - graceS * 1000));
+  const stale = db.prepare(
+    "SELECT id FROM sessions WHERE state = 'recovering' AND last_billed_at < ?"
+  ).all(cutoffIso);
+  for (const s of stale) {
+    try {
+      billing.closeSession(db, { session_id: s.id, end_reason: 'recovery_timeout' });
+    } catch (e) { console.error('[recovery-sweep] close error session', s.id, ':', e.message); }
+  }
+  if (stale.length) console.log('🔄 [recovery-sweep] closed', stale.length, 'recovering sessions older than', graceS + 's');
+}
+
+bootRecoverySweep();
+setInterval(periodicRecoverySweep, 30_000);
 
 const adminDistPath = process.env.ADMIN_DIST || require('path').join(__dirname, '..', 'admin', 'dist');
 const fs = require('fs');

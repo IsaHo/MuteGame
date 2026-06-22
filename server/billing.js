@@ -17,12 +17,19 @@
  *   SeatBusyError         — partial UNIQUE INDEX rejected open
  *   InsufficientFundsError — non-post_pay user owes more than balance (strict mode)
  *
- * Transaction policy: every public helper wraps its work in db.transaction()
- * (better-sqlite3 transactions are nested-via-savepoint, so calling these
- * inside an outer transaction is safe). Optimistic concurrency is asserted
- * on every users-row write via `WHERE credits = c_before AND debt = d_before`
- * + `changes() === 1` — defense in depth against any code path that reads
- * outside the transaction.
+ * Transaction policy: every public helper wraps its work in
+ * `db.transaction(fn).immediate()` which issues `BEGIN IMMEDIATE`. This
+ * serializes concurrent writers at BEGIN time instead of at write
+ * escalation, eliminating spurious DriftDetectedError races between the
+ * ticker and admin actions in the same process. Nested invocations
+ * (caller already inside another better-sqlite3 transaction) degrade to
+ * SAVEPOINT regardless of the outer mode — safe.
+ *
+ * Optimistic concurrency is still asserted on every users-row write
+ * (`WHERE credits = c_before AND debt = d_before` + `changes() === 1`)
+ * as defense in depth — protects against cross-process writers (other
+ * connections to the same file) and against future code paths that
+ * read outside a transaction.
  */
 
 const crypto = require('crypto');
@@ -57,7 +64,8 @@ const VALID_EVENT_TYPES = new Set([
 const CLOSE_REASONS = new Set([
   'user_logout', 'admin_force_logout', 'force_login_displace',
   'recovery_timeout', 'pre_migration', 'no_funds',
-  'closing_routine', 'session_expired',
+  'closing_routine', 'session_expired', 'boot_recovery',
+  'disconnect_reopen',
 ]);
 
 /*
@@ -280,7 +288,7 @@ function openSession(db, { user_id, computer_name, seat_slot = 0, ctx = {}, now 
       multiplier: rate.multiplier,
       started_at: nowIso,
     };
-  })();
+  }).immediate();
 }
 
 /*
@@ -394,7 +402,7 @@ function closeSession(db, { session_id, end_reason, ctx = {}, now = new Date() }
     }
 
     return { session_id, already_closed: false, end_reason, ...finalTick };
-  })();
+  }).immediate();
 }
 
 /*
@@ -412,7 +420,7 @@ function chargeUser(db, { user_id, amount, event_type, description, ctx = {}, se
     user_id, session_id, amount, event_type, mode,
     rate_per_hour: null, multiplier: null, tick_seconds: null,
     description, ctx,
-  }))();
+  })).immediate();
 }
 
 /*
@@ -475,7 +483,7 @@ function creditUser(db, { user_id, amount, event_type, description, ctx = {} }) 
       credits_added: credits_delta,
       debt_paid: -debt_delta,
     };
-  })();
+  }).immediate();
 }
 
 /*
@@ -529,7 +537,7 @@ function manualReconciliation(db, { user_id, credits_delta, debt_delta, reason, 
     });
 
     return { credits_after: c_after, debt_after: d_after };
-  })();
+  }).immediate();
 }
 
 module.exports = {
