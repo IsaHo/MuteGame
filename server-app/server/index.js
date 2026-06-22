@@ -505,6 +505,96 @@ io.on('connection', (socket) => {
     if (c) { c.voiceMuted = false; io.emit('clients:update', Array.from(connectedClients.values())); }
   });
 
+  /*
+   * Phase 4 — kiosk-recovery handshake. Mirror of server/index.js.
+   */
+  socket.on('client:resume', (data) => {
+    const client = connectedClients.get(socket.id);
+    if (!client) return;
+    if (!data || typeof data.session_uuid !== 'string') {
+      socket.emit('resume:rejected', { reason: 'invalid_payload' });
+      return;
+    }
+    const claimedUuid = data.session_uuid;
+    const claimedUserId = Number(data.user_id);
+    const claimedComputer = client.computerName;
+    const syntheticReq = { admin: null, ip: socket.handshake.address || '' };
+
+    for (const [otherId, other] of connectedClients) {
+      if (otherId === socket.id) continue;
+      if (other.sessionUuid && other.sessionUuid === claimedUuid) {
+        try {
+          audit(syntheticReq, 'session.duplicate_resume_attempt', 'session', other.sessionId, {
+            uuid_suffix: claimedUuid.slice(-4),
+            existing_socket_id: otherId,
+            new_socket_id: socket.id,
+            computer_name: claimedComputer,
+          });
+        } catch (e) { console.error('[resume:dup-audit]', e.message); }
+        socket.emit('resume:rejected', { reason: 'duplicate_client' });
+        return;
+      }
+    }
+
+    const db = getDb();
+    let resumed;
+    try {
+      resumed = billing.resumeSession(db, {
+        session_uuid: claimedUuid,
+        computer_name: claimedComputer,
+        user_id: claimedUserId,
+      });
+    } catch (e) {
+      if (e.code === 'RESUME_REJECTED') {
+        try {
+          audit(syntheticReq, 'session.resume.rejected', 'session', null, {
+            uuid_suffix: claimedUuid.slice(-4),
+            reason: e.reason,
+            claimed_computer: claimedComputer,
+            claimed_user_id: claimedUserId,
+            details: e.details || {},
+          });
+        } catch (ae) { console.error('[resume:rej-audit]', ae.message); }
+        socket.emit('resume:rejected', { reason: e.reason });
+        return;
+      }
+      console.error('[client:resume]', e.stack || e.message);
+      socket.emit('resume:rejected', { reason: 'internal_error' });
+      return;
+    }
+
+    client.userId = resumed.user_id;
+    client.username = resumed.username;
+    client.credits = resumed.credits;
+    client.debt = resumed.debt;
+    client.postPay = resumed.post_pay ? 1 : 0;
+    client.status = 'active';
+    client.sessionStart = resumed.start_time;
+    client.sessionId = resumed.session_id;
+    client.sessionUuid = claimedUuid;
+
+    try {
+      audit(syntheticReq, 'session.resume.ok', 'session', resumed.session_id, {
+        uuid_suffix: claimedUuid.slice(-4),
+        was_recovering: resumed.was_recovering,
+        computer_name: claimedComputer,
+        user_id: claimedUserId,
+      });
+    } catch (ae) { console.error('[resume:ok-audit]', ae.message); }
+
+    socket.emit('resume:ok', {
+      session_id: resumed.session_id,
+      locked_rate_per_hour: resumed.locked_rate_per_hour,
+      credits: resumed.credits,
+      debt: resumed.debt,
+      post_pay: resumed.post_pay,
+      last_billed_at: resumed.last_billed_at,
+      computer_name: resumed.computer_name,
+      was_recovering: resumed.was_recovering,
+    });
+    io.emit('clients:update', Array.from(connectedClients.values()));
+  });
+
   socket.on('disconnect', () => {
     const client = connectedClients.get(socket.id);
     if (client?.sessionId) {
@@ -616,25 +706,44 @@ setInterval(() => {
   io.emit('clients:update', Array.from(connectedClients.values()));
 }, 60000);
 
-// ─── Boot + periodic recovery sweep (Phase 3) — mirror of server/index.js
+// ─── Boot + periodic recovery sweep (Phase 3 + Phase 4) — mirror of server/index.js
 function bootRecoverySweep() {
   const db = getDb();
-  const stale = db.prepare("SELECT id FROM sessions WHERE end_time IS NULL").all();
+  const stale = db.prepare("SELECT id, last_billed_at FROM sessions WHERE end_time IS NULL").all();
   if (!stale.length) {
     console.log('🔄 [boot-recovery] no stale sessions');
     return;
   }
-  db.prepare("UPDATE sessions SET state = 'recovering' WHERE end_time IS NULL AND state = 'active'").run();
-  let closed = 0;
+  const maxAgeRow = db.prepare("SELECT value FROM settings WHERE key = 'billing_resume_max_age_seconds'").get();
+  const maxAgeS = Number((maxAgeRow && maxAgeRow.value) || 600);
+  const cutoffMs = Date.now() - maxAgeS * 1000;
+  const nowIso = billing.isoNow(new Date());
+
+  let young = 0, oldClosed = 0;
   for (const s of stale) {
     try {
-      billing.closeSession(db, { session_id: s.id, end_reason: 'boot_recovery' });
-      closed++;
+      const lastMs = billing.parseDbTimestampMs(s.last_billed_at);
+      if (lastMs >= cutoffMs) {
+        db.prepare(
+          "UPDATE sessions SET state='recovering', last_billed_at=? WHERE id=? AND end_time IS NULL"
+        ).run(nowIso, s.id);
+        young++;
+      } else {
+        db.prepare(
+          "UPDATE sessions SET state='recovering' WHERE id=? AND end_time IS NULL AND state='active'"
+        ).run(s.id);
+        billing.closeSession(db, { session_id: s.id, end_reason: 'boot_recovery_age' });
+        oldClosed++;
+      }
     } catch (e) {
-      console.error('[boot-recovery] close error session', s.id, ':', e.message);
+      console.error('[boot-recovery] error session', s.id, ':', e.message);
     }
   }
-  console.log('🔄 [boot-recovery] closed', closed, '/', stale.length, 'stale sessions');
+  console.log(
+    '🔄 [boot-recovery] young→recovering=' + young
+    + ' old→closed=' + oldClosed
+    + ' (cutoff=' + maxAgeS + 's, total=' + stale.length + ')'
+  );
 }
 
 function periodicRecoverySweep() {

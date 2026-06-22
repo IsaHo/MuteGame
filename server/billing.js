@@ -55,6 +55,21 @@ class InsufficientFundsError extends Error {
     this.shortfall = shortfall;
   }
 }
+class ResumeRejectedError extends Error {
+  constructor(reason, details) {
+    super('resume rejected: ' + reason);
+    this.name = 'ResumeRejectedError';
+    this.code = 'RESUME_REJECTED';
+    this.reason = reason;
+    this.details = details || {};
+  }
+}
+
+const RESUME_REJECT_REASONS = new Set([
+  'invalid_payload', 'session_not_found', 'state_closed',
+  'wrong_computer', 'wrong_user', 'recovery_max_age_exceeded',
+  'duplicate_client', 'race_lost', 'internal_error',
+]);
 
 const VALID_EVENT_TYPES = new Set([
   'tick','recharge','debt_pay','debt_add','shop',
@@ -65,7 +80,7 @@ const CLOSE_REASONS = new Set([
   'user_logout', 'admin_force_logout', 'force_login_displace',
   'recovery_timeout', 'pre_migration', 'no_funds',
   'closing_routine', 'session_expired', 'boot_recovery',
-  'disconnect_reopen',
+  'boot_recovery_age', 'disconnect_reopen',
 ]);
 
 /*
@@ -568,6 +583,128 @@ function manualReconciliation(db, { user_id, credits_delta, debt_delta, reason, 
   }).immediate();
 }
 
+/*
+ * resumeSession — kiosk-recovery handshake. Called from server/index.js
+ * client:resume socket handler. Atomically validates the kiosk's claim
+ * to a recovering session and transitions state='recovering' → 'active'
+ * with last_billed_at = `now` (skipping the un-billable
+ * disconnect-to-reconnect gap per the freeze).
+ *
+ * Validation (in order):
+ *   1. session exists by uuid
+ *   2. session.end_time IS NULL and state !== 'closed'
+ *   3. session.computer_name === payload.computer_name
+ *      (defense against cross-PC replay; computer_name is kiosk-asserted
+ *       but raises the bar significantly)
+ *   4. session.user_id === payload.user_id
+ *      (F14 fix per Phase 4 preflight Q1 — defends against kiosk-side
+ *       uuid bleed across sessions)
+ *   5. now - last_billed_at < billing_resume_max_age_seconds (default 600s)
+ *
+ * If session.state === 'recovering': atomic UPDATE to 'active'. changes()===1
+ * required or → ResumeRejectedError('duplicate_client') (lost race to
+ * another resume).
+ *
+ * If session.state === 'active': idempotent re-claim. Same-client retry
+ * during a transient round-trip. Last-billed-at is NOT touched (ticker
+ * has been billing legitimately while session was 'active'). The caller
+ * (server/index.js) is responsible for checking the connectedClients
+ * map to differentiate "same client retry" from "different client
+ * duplicate" — billing.js doesn't know about sockets.
+ *
+ * Throws ResumeRejectedError with .reason set to one of:
+ *   invalid_payload / session_not_found / state_closed /
+ *   wrong_computer / wrong_user / recovery_max_age_exceeded /
+ *   duplicate_client
+ *
+ * Returns: {
+ *   session_id, user_id, username, computer_name,
+ *   credits, debt, post_pay, locked_rate_per_hour,
+ *   last_billed_at (iso, == now), start_time, was_recovering (bool)
+ * }
+ */
+function resumeSession(db, { session_uuid, computer_name, user_id, ctx = {}, now = new Date() }) {
+  if (!session_uuid || typeof session_uuid !== 'string') {
+    throw new ResumeRejectedError('invalid_payload');
+  }
+  if (!computer_name || typeof computer_name !== 'string') {
+    throw new ResumeRejectedError('invalid_payload');
+  }
+  if (!Number.isInteger(user_id)) {
+    throw new ResumeRejectedError('invalid_payload');
+  }
+
+  return db.transaction(() => {
+    const sess = db.prepare(
+      'SELECT s.id, s.user_id, s.computer_name, s.state, s.end_time, '
+      + 's.session_uuid, s.locked_rate_per_hour, s.last_billed_at, '
+      + 's.unpaid_micros, s.start_time, '
+      + 'u.username, u.credits, u.debt, u.post_pay '
+      + 'FROM sessions s LEFT JOIN users u ON u.id = s.user_id '
+      + 'WHERE s.session_uuid = ?'
+    ).get(session_uuid);
+    if (!sess) throw new ResumeRejectedError('session_not_found');
+    if (sess.end_time !== null || sess.state === 'closed') {
+      throw new ResumeRejectedError('state_closed');
+    }
+    if (sess.computer_name !== computer_name) {
+      throw new ResumeRejectedError('wrong_computer', {
+        expected_computer: sess.computer_name,
+      });
+    }
+    if (sess.user_id !== user_id) {
+      throw new ResumeRejectedError('wrong_user', {
+        expected_user: sess.user_id,
+      });
+    }
+
+    // Age check.
+    const maxAgeRow = db.prepare(
+      "SELECT value FROM settings WHERE key = 'billing_resume_max_age_seconds'"
+    ).get();
+    const maxAgeS = Number((maxAgeRow && maxAgeRow.value) || 600);
+    const lastMs = parseDbTimestampMs(sess.last_billed_at);
+    const ageS = (now.getTime() - lastMs) / 1000;
+    if (ageS > maxAgeS) {
+      throw new ResumeRejectedError('recovery_max_age_exceeded', {
+        age_s: ageS, max_age_s: maxAgeS,
+      });
+    }
+
+    const nowIso = isoNow(now);
+    let wasRecovering = false;
+    if (sess.state === 'recovering') {
+      // Atomic transition. Only ONE concurrent resume can win — the
+      // others see changes()===0 and get duplicate_client.
+      const upd = db.prepare(
+        "UPDATE sessions SET state='active', last_billed_at=? "
+        + "WHERE id=? AND state='recovering'"
+      ).run(nowIso, sess.id);
+      if (upd.changes !== 1) {
+        throw new ResumeRejectedError('duplicate_client');
+      }
+      wasRecovering = true;
+    }
+    // state === 'active': idempotent re-claim. Don't touch last_billed_at;
+    // ticker has been billing normally. Caller checks connectedClients
+    // map to enforce same-vs-different-client policy.
+
+    return {
+      session_id: sess.id,
+      user_id: sess.user_id,
+      username: sess.username,
+      computer_name: sess.computer_name,
+      credits: sess.credits,
+      debt: sess.debt,
+      post_pay: sess.post_pay ? 1 : 0,
+      locked_rate_per_hour: sess.locked_rate_per_hour,
+      last_billed_at: wasRecovering ? nowIso : sess.last_billed_at,
+      start_time: sess.start_time,
+      was_recovering: wasRecovering,
+    };
+  }).immediate();
+}
+
 module.exports = {
   openSession,
   closeSession,
@@ -578,9 +715,12 @@ module.exports = {
   computeCurrentRate,
   isoNow,
   parseDbTimestampMs,
+  resumeSession,
   DriftDetectedError,
   SeatBusyError,
   InsufficientFundsError,
+  ResumeRejectedError,
   VALID_EVENT_TYPES,
   CLOSE_REASONS,
+  RESUME_REJECT_REASONS,
 };

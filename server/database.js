@@ -792,10 +792,17 @@ function applyBillingSchemaV2(db) {
 
   // ── S6. Settings ────────────────────────────────────────────────────
   const settingDefaults = [
-    ['billing_engine_version',         '2'],
-    ['billing_recovery_grace_seconds', '120'],
-    ['billing_kiosk_lockout_level',    'medium'],
-    ['billing_clock_warp_tolerance_s', '60'],
+    ['billing_engine_version',           '2'],
+    ['billing_recovery_grace_seconds',   '120'],
+    ['billing_kiosk_lockout_level',      'medium'],
+    ['billing_clock_warp_tolerance_s',   '60'],
+    // Phase 4 addition (piggybacks on Phase 2's idempotent settings
+    // sweep). Maximum age in seconds for client:resume / boot recovery
+    // young-session transition. Sessions whose last_billed_at is older
+    // than this are no longer recoverable; resume returns
+    // recovery_max_age_exceeded and boot sweep closes them as
+    // boot_recovery_age. Default: 10 minutes.
+    ['billing_resume_max_age_seconds',   '600'],
   ];
   const upsert = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of settingDefaults) {
