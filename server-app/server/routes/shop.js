@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getDb } = require('../database');
+const billing = require('../billing');
 const { audit } = require('../audit');
 
 // Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
@@ -120,42 +121,56 @@ router.post('/orders/:id/approve', adminIpGuard, (req, res) => {
   if (order.status !== 'pending') return res.status(400).json({ error: 'این سفارش قبلاً پردازش شده' });
 
   const items = JSON.parse(order.items);
-  let updatedUser = null;
+  let chargeResult = null;
+  const adminCtx = { admin_id: req.admin && req.admin.id };
 
-  db.transaction(() => {
-    // Deduct stock
-    for (const item of items) {
-      const dbItem = db.prepare('SELECT stock FROM shop_items WHERE id = ?').get(item.id);
-      if (dbItem && dbItem.stock !== -1) {
-        db.prepare('UPDATE shop_items SET stock = MAX(0, stock - ?) WHERE id = ?').run(item.qty, item.id);
+  try {
+    db.transaction(() => {
+      for (const item of items) {
+        const dbItem = db.prepare('SELECT stock FROM shop_items WHERE id = ?').get(item.id);
+        if (dbItem && dbItem.stock !== -1) {
+          db.prepare('UPDATE shop_items SET stock = MAX(0, stock - ?) WHERE id = ?').run(item.qty, item.id);
+        }
       }
-    }
 
-    if (order.payment_method === 'credits' && order.user_id) {
-      const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(order.user_id);
-      if (user && user.credits >= order.total) {
-        db.prepare('UPDATE users SET credits = credits - ? WHERE id = ?').run(order.total, order.user_id);
-        db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-          .run(order.user_id, -order.total, 'shop', `خرید از شاپ: ${items.map(i => i.name).join(', ')}`);
-        updatedUser = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(order.user_id);
+      if (order.payment_method === 'credits' && order.user_id) {
+        chargeResult = billing.chargeUser(db, {
+          user_id: order.user_id,
+          amount: order.total,
+          event_type: 'shop',
+          mode: 'strict',
+          description: 'خرید از شاپ: ' + items.map(i => i.name).join(', '),
+          ctx: adminCtx,
+        });
       }
+
+      db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('completed', req.params.id);
+      audit(req, 'shop.order.approve', 'shop_order', req.params.id, {
+        total: order.total,
+        payment_method: order.payment_method,
+        user_id: order.user_id,
+        items: items.map(i => ({ id: i.id, name: i.name, qty: i.qty, price: i.price })),
+        credits_deducted: chargeResult ? order.total : 0,
+      });
+    })();
+  } catch (e) {
+    if (e.code === 'INSUFFICIENT_FUNDS') {
+      return res.status(400).json({
+        error: 'اعتبار کافی نیست',
+        shortfall: e.shortfall,
+        user_id: e.user_id,
+      });
     }
+    console.error('[shop.approve]', e.stack || e.message);
+    return res.status(500).json({ error: e.message || 'خطای داخلی' });
+  }
 
-    db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('completed', req.params.id);
-    audit(req, 'shop.order.approve', 'shop_order', req.params.id, {
-      total: order.total,
-      payment_method: order.payment_method,
-      user_id: order.user_id,
-      items: items.map(i => ({ id: i.id, name: i.name, qty: i.qty, price: i.price })),
-      credits_deducted: order.payment_method === 'credits' && updatedUser ? order.total : 0,
-    });
-  })();
-
-  if (updatedUser) {
+  if (chargeResult) {
     connectedClients.forEach((client, socketId) => {
       if (client.userId == order.user_id) {
-        client.credits = updatedUser.credits;
-        io.to(socketId).emit('credits:update', { credits: updatedUser.credits, debt: updatedUser.debt });
+        client.credits = chargeResult.c_after;
+        client.debt = chargeResult.d_after;
+        io.to(socketId).emit('credits:update', { credits: chargeResult.c_after, debt: chargeResult.d_after });
       }
     });
   }

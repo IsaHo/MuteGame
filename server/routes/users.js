@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { getDb } = require('../database');
+const billing = require('../billing');
 const { audit } = require('../audit');
 
 // Lazy-load: middlewares are registered on app and we read them at request time.
@@ -143,24 +144,35 @@ router.post('/', adminIpGuard, (req, res) => {
   const { name = '', family = '', phone = '', credits = 0,
           limit_minutes = 0, allowed_seats = 1, post_pay = 0, limit_time = 0 } = req.body;
   const db = getDb();
+  const initialCredits = Math.max(0, Number(credits) || 0);
+  const adminCtx = { admin_id: req.admin && req.admin.id };
   try {
     let username, result;
     db.transaction(() => {
       const num = nextUserNumber(db);
       username = String(num);
       const hash = bcrypt.hashSync(username, 10);
+      // Always insert with credits=0. The initial-credit ledger row is
+      // emitted by billing.creditUser below — keeps the
+      // forbidden-direct-writes invariant: every non-zero credit balance
+      // gets exactly one credit_ledger row recording how it got there.
       result = db.prepare(
-        'INSERT INTO users (username, password, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      ).run(username, hash, name.trim(), family.trim(), phone.trim(), credits,
+        'INSERT INTO users (username, password, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)'
+      ).run(username, hash, name.trim(), family.trim(), phone.trim(),
             Number(limit_minutes) || 0, Math.max(1, Number(allowed_seats) || 1),
             post_pay ? 1 : 0, limit_time ? 1 : 0);
-      if (credits > 0) {
-        db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-          .run(result.lastInsertRowid, credits, 'charge', 'شارژ اولیه');
+      if (initialCredits > 0) {
+        billing.creditUser(db, {
+          user_id: result.lastInsertRowid,
+          amount: initialCredits,
+          event_type: 'manual_credit',
+          description: 'شارژ اولیه',
+          ctx: adminCtx,
+        });
       }
-      audit(req, 'user.create', 'user', result.lastInsertRowid, { username, name, family, phone, credits, limit_minutes, allowed_seats, post_pay, limit_time });
+      audit(req, 'user.create', 'user', result.lastInsertRowid, { username, name, family, phone, credits: initialCredits, limit_minutes, allowed_seats, post_pay, limit_time });
     })();
-    res.json({ id: result.lastInsertRowid, username, name, family, phone, credits });
+    res.json({ id: result.lastInsertRowid, username, name, family, phone, credits: initialCredits });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -255,98 +267,140 @@ router.post('/:id/post-pay', adminIpGuard, (req, res) => {
 router.post('/:id/charge', adminIpGuard, (req, res) => {
   const { amount, description, free = false } = req.body;
   const db = getDb();
+  const userId = Number(req.params.id);
+  const adminCtx = { admin_id: req.admin && req.admin.id };
 
   // Free charge: skip discount logic (it's already a gift) and don't bump
-  // total_spent (which feeds tier rankings) — also tag the txn type so it
-  // doesn't pollute revenue reports.
+  // total_spent (which feeds tier rankings). Maps to 'manual_credit'
+  // (credits-only, no debt-pay-first) per the C3 preflight decision.
   if (free) {
     const amt = Number(amount);
+    if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
     const desc = description || '🎁 شارژ رایگان (هدیه ادمین)';
-    let user;
+    let result;
     db.transaction(() => {
-      db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(amt, req.params.id);
-      db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-        .run(req.params.id, amt, 'free_gift', desc);
-      audit(req, 'user.charge.free', 'user', req.params.id, { amount: amt, description: desc });
-      user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+      result = billing.creditUser(db, {
+        user_id: userId, amount: amt,
+        event_type: 'manual_credit', description: desc,
+        ctx: adminCtx,
+      });
+      audit(req, 'user.charge.free', 'user', userId, { amount: amt, description: desc });
     })();
-    syncClientCredits(req, req.params.id, user.credits, user.debt);
-    return res.json({ credits: user.credits, bonus: 0, discount: 0, free: true });
+    syncClientCredits(req, userId, result.credits_after, result.debt_after);
+    return res.json({ credits: result.credits_after, bonus: 0, discount: 0, free: true });
   }
 
-  const { total, bonus, discount } = applyDiscount(db, req.params.id, Number(amount));
+  const requested = Number(amount);
+  if (!(requested > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  const { total, bonus, discount } = applyDiscount(db, userId, requested);
 
   const desc = description || (bonus > 0
-    ? `شارژ ${Number(amount).toLocaleString()} ریال + ${bonus.toLocaleString()} ریال تخفیف (${discount}%)`
+    ? `شارژ ${requested.toLocaleString()} ریال + ${bonus.toLocaleString()} ریال تخفیف (${discount}%)`
     : 'شارژ دستی توسط ادمین');
 
-  let user;
+  let result;
   db.transaction(() => {
-    db.prepare('UPDATE users SET credits = credits + ?, total_spent = total_spent + ? WHERE id = ?')
-      .run(total, Number(amount), req.params.id);
-    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-      .run(req.params.id, total, 'charge', desc);
-    audit(req, 'user.charge', 'user', req.params.id, { requested: Number(amount), total, bonus, discount, description: desc });
-    user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    // 'recharge' pays outstanding debt first then deposits remainder to
+    // credits — matches the C3 preflight decision (Q3). Operator can
+    // top up + settle debt in one action.
+    result = billing.creditUser(db, {
+      user_id: userId, amount: total,
+      event_type: 'recharge', description: desc,
+      ctx: adminCtx,
+    });
+    // total_spent denorm bump (Q2). Tracks cumulative cash paid by the
+    // customer; feeds tier rankings. Bumps by the ORIGINAL requested
+    // amount, not total (bonus is not customer-paid cash).
+    db.prepare('UPDATE users SET total_spent = total_spent + ? WHERE id = ?').run(requested, userId);
+    audit(req, 'user.charge', 'user', userId, { requested, total, bonus, discount, description: desc, debt_paid: result.debt_paid, credits_added: result.credits_added });
   })();
-  syncClientCredits(req, req.params.id, user.credits, user.debt);
-  res.json({ credits: user.credits, bonus, discount });
+  syncClientCredits(req, userId, result.credits_after, result.debt_after);
+  res.json({ credits: result.credits_after, bonus, discount });
 });
 
-// Decharge (remove credits)
+// Decharge (remove credits). Uses partial mode so a request exceeding
+// the user's available credit drains to zero (preserves the old
+// MAX(0, credits - amount) semantic) and reports the shortfall in audit
+// details rather than throwing.
 router.post('/:id/decharge', adminIpGuard, (req, res) => {
   const { amount, description = 'کاهش شارژ توسط ادمین' } = req.body;
   const db = getDb();
-  let user;
+  const amt = Number(amount);
+  if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  const userId = Number(req.params.id);
+  const adminCtx = { admin_id: req.admin && req.admin.id };
+  let result;
   db.transaction(() => {
-    db.prepare('UPDATE users SET credits = MAX(0, credits - ?) WHERE id = ?').run(Number(amount), req.params.id);
-    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-      .run(req.params.id, -Number(amount), 'decharge', description);
-    audit(req, 'user.decharge', 'user', req.params.id, { amount: Number(amount), description });
-    user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    result = billing.chargeUser(db, {
+      user_id: userId, amount: amt,
+      event_type: 'manual_debit', description, mode: 'partial',
+      ctx: adminCtx,
+    });
+    audit(req, 'user.decharge', 'user', userId, {
+      requested: amt,
+      charged: amt - result.shortfall,
+      shortfall: result.shortfall,
+      description,
+    });
   })();
-  syncClientCredits(req, req.params.id, user.credits, user.debt);
-  res.json({ credits: user.credits });
+  syncClientCredits(req, userId, result.c_after, result.d_after);
+  res.json({ credits: result.c_after });
 });
 
-// Add debt
+// Add debt — debt += amount, credits untouched. Uses the dedicated
+// 'debt_add' branch in chargeUser (added in C3A). debt_since is set
+// on the zero→nonzero transition only (denorm follow-up).
 router.post('/:id/debt/add', adminIpGuard, (req, res) => {
   const { amount, description = 'افزایش بدهی' } = req.body;
   const db = getDb();
-  const current = db.prepare('SELECT debt FROM users WHERE id = ?').get(req.params.id);
-  const wasZero = !current || current.debt <= 0;
-
-  let user;
+  const amt = Number(amount);
+  if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  const userId = Number(req.params.id);
+  const adminCtx = { admin_id: req.admin && req.admin.id };
+  let result;
   db.transaction(() => {
-    db.prepare('UPDATE users SET debt = debt + ?' + (wasZero ? ', debt_since = CURRENT_TIMESTAMP' : '') + ' WHERE id = ?')
-      .run(Number(amount), req.params.id);
-    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-      .run(req.params.id, Number(amount), 'debt_add', description);
-    audit(req, 'user.debt.add', 'user', req.params.id, { amount: Number(amount), description });
-    user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    result = billing.chargeUser(db, {
+      user_id: userId, amount: amt,
+      event_type: 'debt_add', description,
+      ctx: adminCtx,
+    });
+    // debt_since denorm — set only on zero→nonzero transition. We can
+    // detect this without a pre-read: result.c_after - result.credits_delta
+    // is c_before (== c_after for debt_add since credits_delta=0), and
+    // result.d_after - result.debt_delta == d_before. d_before==0 → was-zero.
+    if (result.d_after - result.debt_delta === 0) {
+      db.prepare('UPDATE users SET debt_since = CURRENT_TIMESTAMP WHERE id = ? AND debt_since IS NULL').run(userId);
+    }
+    audit(req, 'user.debt.add', 'user', userId, { amount: amt, description });
   })();
-  notifyClient(req, req.params.id, 'credits:update', { credits: user.credits, debt: user.debt });
-  res.json({ debt: user.debt });
+  notifyClient(req, userId, 'credits:update', { credits: result.c_after, debt: result.d_after });
+  res.json({ debt: result.d_after });
 });
 
-// Pay debt
+// Pay debt — debt -= min(amount, debt). Excess silently dropped (matches
+// the old MAX(0, debt - amount) semantic). debt_since is cleared on the
+// debt→0 transition (denorm follow-up).
 router.post('/:id/debt/pay', adminIpGuard, (req, res) => {
   const { amount, description = 'پرداخت بدهی' } = req.body;
   const db = getDb();
-  let updated;
+  const amt = Number(amount);
+  if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  const userId = Number(req.params.id);
+  const adminCtx = { admin_id: req.admin && req.admin.id };
+  let result;
   db.transaction(() => {
-    db.prepare('UPDATE users SET debt = MAX(0, debt - ?) WHERE id = ?').run(Number(amount), req.params.id);
-    const user = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
-    if (user.debt <= 0) {
-      db.prepare('UPDATE users SET debt = 0, debt_since = NULL WHERE id = ?').run(req.params.id);
+    result = billing.creditUser(db, {
+      user_id: userId, amount: amt,
+      event_type: 'debt_pay', description,
+      ctx: adminCtx,
+    });
+    if (result.debt_after === 0) {
+      db.prepare('UPDATE users SET debt_since = NULL WHERE id = ?').run(userId);
     }
-    db.prepare('INSERT INTO credit_transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)')
-      .run(req.params.id, -Number(amount), 'debt_pay', description);
-    audit(req, 'user.debt.pay', 'user', req.params.id, { amount: Number(amount), description });
-    updated = db.prepare('SELECT credits, debt FROM users WHERE id = ?').get(req.params.id);
+    audit(req, 'user.debt.pay', 'user', userId, { requested: amt, paid: result.debt_paid, description });
   })();
-  notifyClient(req, req.params.id, 'credits:update', { credits: updated.credits, debt: updated.debt });
-  res.json({ debt: updated.debt });
+  notifyClient(req, userId, 'credits:update', { credits: result.credits_after, debt: result.debt_after });
+  res.json({ debt: result.debt_after });
 });
 
 router.get('/:id/transactions', (req, res) => {
