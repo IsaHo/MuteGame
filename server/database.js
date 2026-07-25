@@ -437,6 +437,9 @@ function initDatabase() {
     applyCrashLogSchema(db);
   } catch (e) { console.error('crash-log-schema:', e.stack || e.message); throw e; }
 
+  // ─── P0 — expenses table (idempotent) ────────────────────────────────
+  applyExpensesSchema(db);
+
   console.log('✅ Database ready');
 }
 
@@ -1036,4 +1039,35 @@ function applyCrashLogSchema(db) {
   return { applied: true };
 }
 
-module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema };
+/*
+ * P0 — expenses table. Idempotent: CREATE IF NOT EXISTS + IF NOT EXISTS indexes.
+ * No existing tables are altered. Safe to skip on rollback (table is simply ignored).
+ */
+function applyExpensesSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS expenses (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      date             TEXT    NOT NULL,
+      category         TEXT    NOT NULL DEFAULT 'سایر',
+      description      TEXT    NOT NULL DEFAULT '',
+      amount           INTEGER NOT NULL CHECK (typeof(amount) = 'integer' AND amount > 0),
+      payment_method   TEXT    NOT NULL DEFAULT 'cash'
+                               CHECK (payment_method IN ('cash','card','transfer')),
+      admin_id         INTEGER NOT NULL,
+      admin_username   TEXT    NOT NULL,
+      is_void          INTEGER NOT NULL DEFAULT 0 CHECK (is_void IN (0, 1)),
+      void_reason      TEXT,
+      voided_by_admin  INTEGER,
+      voided_at        DATETIME,
+      idempotency_key  TEXT    UNIQUE,
+      migrated         INTEGER NOT NULL DEFAULT 0 CHECK (migrated IN (0, 1)),
+      created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_expenses_date    ON expenses (date);
+    CREATE INDEX IF NOT EXISTS idx_expenses_admin   ON expenses (admin_id);
+    CREATE INDEX IF NOT EXISTS idx_expenses_created ON expenses (created_at);
+  `);
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema, applyExpensesSchema };

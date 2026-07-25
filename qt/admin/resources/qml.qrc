@@ -1,0 +1,42 @@
+<RCC>
+    <qresource prefix="/qt/qml">
+        <file alias="Main.qml">../qml/Main.qml</file>
+        <file alias="theme/Theme.qml">../qml/theme/Theme.qml</file>
+        <file alias="theme/qmldir">../qml/theme/qmldir</file>
+        <file alias="components/GlassCard.qml">../qml/components/GlassCard.qml</file>
+        <file alias="components/GlassButton.qml">../qml/components/GlassButton.qml</file>
+        <file alias="components/GlassInput.qml">../qml/components/GlassInput.qml</file>
+        <file alias="components/BgEffects.qml">../qml/components/BgEffects.qml</file>
+        <file alias="components/Sidebar.qml">../qml/components/Sidebar.qml</file>
+        <file alias="components/LineChart.qml">../qml/components/LineChart.qml</file>
+        <file alias="components/BarChart.qml">../qml/components/BarChart.qml</file>
+        <file alias="components/Sparkline.qml">../qml/components/Sparkline.qml</file>
+        <file alias="components/LivePcsPanel.qml">../qml/components/LivePcsPanel.qml</file>
+        <file alias="components/SessionsTable.qml">../qml/components/SessionsTable.qml</file>
+        <file alias="components/ActionModal.qml">../qml/components/ActionModal.qml</file>
+        <file alias="components/PcContextMenu.qml">../qml/components/PcContextMenu.qml</file>
+        <file alias="components/UserRow.qml">../qml/components/UserRow.qml</file>
+        <file alias="components/UserFormModal.qml">../qml/components/UserFormModal.qml</file>
+        <file alias="components/UserFinanceModal.qml">../qml/components/UserFinanceModal.qml</file>
+        <file alias="components/Toast.qml">../qml/components/Toast.qml</file>
+        <file alias="components/ConfirmDialog.qml">../qml/components/ConfirmDialog.qml</file>
+        <file alias="components/CreatedUserBanner.qml">../qml/components/CreatedUserBanner.qml</file>
+        <file alias="components/EmojiPicker.qml">../qml/components/EmojiPicker.qml</file>
+        <file alias="components/ShopItemModal.qml">../qml/components/ShopItemModal.qml</file>
+        <file alias="components/ShopItemCard.qml">../qml/components/ShopItemCard.qml</file>
+        <file alias="components/OrderCard.qml">../qml/components/OrderCard.qml</file>
+        <file alias="components/JalaliDatePicker.qml">../qml/components/JalaliDatePicker.qml</file>
+        <file alias="components/VoiceCallModal.qml">../qml/components/VoiceCallModal.qml</file>
+        <file alias="pages/LoginPage.qml">../qml/pages/LoginPage.qml</file>
+        <file alias="pages/DashboardPage.qml">../qml/pages/DashboardPage.qml</file>
+        <file alias="pages/UsersPage.qml">../qml/pages/UsersPage.qml</file>
+        <file alias="pages/ShopPage.qml">../qml/pages/ShopPage.qml</file>
+        <file alias="pages/AccountingPage.qml">../qml/pages/AccountingPage.qml</file>
+        <file alias="pages/SettingsPage.qml">../qml/pages/SettingsPage.qml</file>
+        <file alias="pages/ComputersPage.qml">../qml/pages/ComputersPage.qml</file>
+        <file alias="pages/GamesPage.qml">../qml/pages/GamesPage.qml</file>
+        <file alias="pages/NetworkPage.qml">../qml/pages/NetworkPage.qml</file>
+        <file alias="pages/ReportsPage.qml">../qml/pages/ReportsPage.qml</file>
+        <file alias="pages/AdminsPage.qml">../qml/pages/AdminsPage.qml</file>
+    </qresource>
+</RCC>

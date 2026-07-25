@@ -20,10 +20,11 @@
 - کاتالوگ بازی و کتابخانه تصویر.
 - کاربران، ادمین‌ها، نقش‌ها و audit.
 - credit ledger، بازیابی نشست، backup و crash reporting در commits اخیر.
+- هزینه‌های حسابداری server-side با مهاجرت امن داده‌های محلی، soft-void و audit اتمیک.
 
 ## ریسک‌های فعلی
 
-- شاخه `main` تا commit `3fa6b95` با `origin/main` همگام شده است.
+- شاخه `main` با `origin/main` همگام است؛ وضعیت دقیق commit در هر تحویل ثبت می‌شود.
 - worktree شامل تغییرات قدیمی و جدید متعدد است.
 - conflict فایل `client/renderer/src/main.jsx` با حفظ هر دو قابلیت lockdown و crash reporting mark-resolved شده، اما تغییرات Electron هنوز commit نشده‌اند.
 - فایل‌های تولیدی، `.DS_Store`، دیتابیس و executableها نباید وارد commit سورس شوند.

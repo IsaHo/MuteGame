@@ -2,7 +2,7 @@
 
 مالک اجرا: Claude Code  
 مالک تصمیم و پذیرش: مدیر پروژه  
-وضعیت: آماده طراحی تفصیلی
+وضعیت: در حال اجرا
 
 ## هدف
 
@@ -12,10 +12,12 @@
 
 ### 1. Expenses
 
-- جدول `expenses` با amount، category، description، payment_method، admin_id، shift_id و timestamps.
-- CRUD با permission مالی و audit.
-- migration از QSettings با import یک‌باره و جلوگیری از duplicate.
-- AccountingPage فقط از API بخواند.
+- [x] جدول server-side `expenses` با مبلغ صحیح ریالی، روش پرداخت، اطلاعات ادمین و soft-void.
+- [x] ثبت، ویرایش، فهرست و ابطال با permission مالی و audit اتمیک.
+- [x] migration یک‌باره QSettings با idempotency و حفظ نسخه محلی تا تأیید کامل سرور.
+- [x] اتصال AccountingPage به API مرکزی.
+- [x] ۱۴ تست خودکار برای اعتبارسنجی، idempotency، import اتمیک و audit.
+- [ ] اتصال هزینه‌ها به `shift_id` پس از ساخته‌شدن زیرسیستم شیفت.
 
 ### 2. Shifts
 
