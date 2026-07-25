@@ -251,15 +251,15 @@ Item {
 
     UserFinanceModal {
         id: financeModal
-        onSubmitted: (op, rialAmount, description) => {
+        onSubmitted: (op, rialAmount, description, paymentMethod) => {
             const id = financeModal.user.id;
-            if (op === "charge")        Api.chargeUser(id, rialAmount, description, false);
+            if (op === "charge")        Api.chargeUser(id, rialAmount, description, false, paymentMethod);
             else if (op === "free_charge")  Api.chargeUser(id, rialAmount, description, true);
             else if (op === "charge_debt")  { Api.addDebt(id, rialAmount, "شارژ بدهی: " + description);
                                               Api.chargeUser(id, rialAmount, "شارژ بدهی", true); }
             else if (op === "decharge") Api.dechargeUser(id, rialAmount, description);
             else if (op === "debt_add") Api.addDebt(id, rialAmount, description);
-            else if (op === "debt_pay") Api.payDebt(id, rialAmount, description);
+            else if (op === "debt_pay") Api.payDebt(id, rialAmount, description, paymentMethod);
         }
     }
 

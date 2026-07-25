@@ -55,7 +55,11 @@ function getExpenses(db, { dateFrom, dateTo, category, includeVoid } = {}) {
     return { expenses: rows, total: rows.reduce((s, r) => s + r.amount, 0) };
 }
 
-function createExpense(db, body, admin, auditFn) {
+// getShiftIdFn is optional; when provided it is called INSIDE the transaction so
+// the shift lookup and the INSERT are atomic. Pass null to skip shift attachment.
+// Injecting the function keeps this module free of a shift-service dependency and
+// makes the behaviour directly testable.
+function createExpense(db, body, admin, auditFn, getShiftIdFn = null) {
     const err = validateExpense(body);
     if (err) return { status: 400, body: { error: err } };
 
@@ -72,16 +76,17 @@ function createExpense(db, body, admin, auditFn) {
 
     let newRow;
     db.transaction(() => {
+        const shiftId = getShiftIdFn ? getShiftIdFn(db) : null;
         const r = db.prepare(
             `INSERT INTO expenses (date, category, description, amount, payment_method,
-                                   admin_id, admin_username, idempotency_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+                                   admin_id, admin_username, idempotency_key, shift_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(body.date, category, desc, Number(body.amount), payment_method,
-              admin.id, admin.username, key);
+              admin.id, admin.username, key, shiftId || null);
 
         newRow = db.prepare(`SELECT ${SELECT_COLS} FROM expenses WHERE id = ?`).get(r.lastInsertRowid);
         auditFn('expense.create', 'expense', newRow.id,
-                { date: body.date, category, amount: Number(body.amount), payment_method });
+                { date: body.date, category, amount: Number(body.amount), payment_method, shift_id: shiftId || null });
     })();
 
     return { status: 201, body: { expense: newRow } };

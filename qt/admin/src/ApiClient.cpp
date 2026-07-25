@@ -304,12 +304,16 @@ void ApiClient::deleteUser(int id)
         reply->deleteLater();
     });
 }
-void ApiClient::chargeUser(int id, qint64 amount, const QString &description, bool free)
+void ApiClient::chargeUser(int id, qint64 amount, const QString &description, bool free, const QString &paymentMethod)
 {
-    postJson(QString("/api/users/%1/charge").arg(id),
-             { { "amount", static_cast<double>(amount) },
-               { "description", description },
-               { "free", free } },
+    QJsonObject body{
+        { "amount", static_cast<double>(amount) },
+        { "description", description },
+        { "free", free }
+    };
+    if (!free && !paymentMethod.isEmpty())
+        body["payment_method"] = paymentMethod;
+    postJson(QString("/api/users/%1/charge").arg(id), body,
              [this](QNetworkReply *reply) {
         const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
         emit userMutationDone(reply->error() == QNetworkReply::NoError,
@@ -336,10 +340,15 @@ void ApiClient::addDebt(int id, qint64 amount, const QString &description)
                               obj.value("error").toString(), obj);
     });
 }
-void ApiClient::payDebt(int id, qint64 amount, const QString &description)
+void ApiClient::payDebt(int id, qint64 amount, const QString &description, const QString &paymentMethod)
 {
-    postJson(QString("/api/users/%1/debt/pay").arg(id),
-             { { "amount", static_cast<double>(amount) }, { "description", description } },
+    QJsonObject body{
+        { "amount", static_cast<double>(amount) },
+        { "description", description }
+    };
+    if (!paymentMethod.isEmpty())
+        body["payment_method"] = paymentMethod;
+    postJson(QString("/api/users/%1/debt/pay").arg(id), body,
              [this](QNetworkReply *reply) {
         const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
         emit userMutationDone(reply->error() == QNetworkReply::NoError,
@@ -843,6 +852,68 @@ void ApiClient::importExpenses(const QJsonArray &items)
     postJson("/api/expenses/import", body, [this](QNetworkReply *reply) {
         QString err; QJsonObject b;
         emit importExpensesDone(replyOk(reply, err, b), b);
+    });
+}
+
+// ── Shifts ────────────────────────────────────────────────────────────
+void ApiClient::openShift(int openingCash)
+{
+    postJson("/api/shifts", { { "opening_cash", openingCash } },
+             [this](QNetworkReply *reply) {
+        const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+        if (reply->error() != QNetworkReply::NoError || obj.contains("error"))
+            emit openShiftFailed(obj.value("error").toString(reply->errorString()));
+        else
+            emit shiftOpened(obj.value("shift").toObject());
+    });
+}
+void ApiClient::getOpenShift()
+{
+    getJson("/api/shifts/open", [this](QNetworkReply *reply) {
+        if (reply->error() != QNetworkReply::NoError) {
+            const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+            if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404)
+                emit openShiftNotFound();
+            else
+                emit networkError(reply->errorString());
+            return;
+        }
+        emit openShiftLoaded(QJsonDocument::fromJson(reply->readAll()).object()
+                             .value("shift").toObject());
+    });
+}
+void ApiClient::previewShift(int shiftId)
+{
+    getJson(QString("/api/shifts/%1/preview").arg(shiftId),
+            [this](QNetworkReply *reply) {
+        const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+        if (reply->error() != QNetworkReply::NoError || obj.contains("error"))
+            emit shiftPreviewFailed(obj.value("error").toString(reply->errorString()));
+        else
+            emit shiftPreviewReady(obj);
+    });
+}
+void ApiClient::closeShift(int shiftId, int countedCash, const QString &closeNote)
+{
+    QJsonObject body{ { "counted_cash", countedCash } };
+    if (!closeNote.isEmpty()) body["close_note"] = closeNote;
+    postJson(QString("/api/shifts/%1/close").arg(shiftId), body,
+             [this](QNetworkReply *reply) {
+        const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+        if (reply->error() != QNetworkReply::NoError || obj.contains("error"))
+            emit shiftCloseFailed(obj.value("error").toString(reply->errorString()));
+        else
+            emit shiftClosed(obj.value("shift").toObject(),
+                             obj.value("already_closed").toBool());
+    });
+}
+void ApiClient::getShifts(int limit)
+{
+    getJson(QString("/api/shifts?limit=%1").arg(limit),
+            [this](QNetworkReply *reply) {
+        if (reply->error() != QNetworkReply::NoError) { emit networkError(reply->errorString()); return; }
+        const auto obj = QJsonDocument::fromJson(reply->readAll()).object();
+        emit shiftsLoaded(obj.value("shifts").toArray());
     });
 }
 

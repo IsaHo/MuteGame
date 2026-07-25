@@ -3,6 +3,7 @@ const router = express.Router();
 const { getDb } = require('../database');
 const billing = require('../billing');
 const { audit } = require('../audit');
+const { getOpenShiftId } = require('../shift-service');
 
 // Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
 // (defense-in-depth). Both must pass for the route to run.
@@ -122,6 +123,8 @@ router.post('/orders', (req, res) => {
     }
   }
 
+  // shift_id is intentionally NULL at create — pending orders belong to no shift.
+  // It is set to the then-current open shift when the order is approved/completed.
   const result = db.prepare(
     'INSERT INTO shop_orders (user_id, computer_name, items, total, payment_method, status) VALUES (?, ?, ?, ?, ?, ?)'
   ).run(userId || null, computerName || null, JSON.stringify(enrichedItems), total, paymentMethod, 'pending');
@@ -160,6 +163,9 @@ router.post('/orders/:id/approve', adminIpGuard, (req, res) => {
 
   try {
     db.transaction(() => {
+      // The financial owner is the shift open at approval time.
+      const approveShiftId = getOpenShiftId(db);
+
       // Deduct stock
       for (const item of items) {
         const dbItem = db.prepare('SELECT stock FROM shop_items WHERE id = ?').get(item.id);
@@ -179,10 +185,14 @@ router.post('/orders/:id/approve', adminIpGuard, (req, res) => {
           mode: 'strict',
           description: 'خرید از شاپ: ' + items.map(i => i.name).join(', '),
           ctx: adminCtx,
+          shift_id: approveShiftId,
+          payment_method: 'wallet',
         });
       }
 
-      db.prepare('UPDATE shop_orders SET status = ? WHERE id = ?').run('completed', req.params.id);
+      // Attach order to the shift that is open at approve time, not at create time.
+      db.prepare('UPDATE shop_orders SET status = ?, shift_id = ? WHERE id = ?')
+        .run('completed', approveShiftId, req.params.id);
       audit(req, 'shop.order.approve', 'shop_order', req.params.id, {
         total: order.total,
         payment_method: order.payment_method,

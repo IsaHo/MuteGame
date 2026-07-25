@@ -35,7 +35,8 @@ Item {
         { label: "🌐 شبکه",       perms: ["network.view", "network.edit"] },
         { label: "⚙️ تنظیمات",    perms: ["settings.view", "settings.edit"] },
         { label: "👑 ادمین‌ها",   perms: ["admins.view", "admins.edit"] },
-        { label: "📈 گزارشات",    perms: ["reports.view", "audit.view"] }
+        { label: "📈 گزارشات",    perms: ["reports.view", "audit.view"] },
+        { label: "🏧 شیفت",       perms: ["shifts.view", "shifts.manage"] }
     ]
     readonly property var permLabels: ({
         "users.view":      "مشاهده کاربران",
@@ -55,7 +56,9 @@ Item {
         "admins.view":     "مشاهده ادمین‌ها",
         "admins.edit":     "مدیریت ادمین‌ها",
         "reports.view":    "مشاهده گزارش‌ها",
-        "audit.view":      "مشاهده لاگ عملیات"
+        "audit.view":      "مشاهده لاگ عملیات",
+        "shifts.view":     "مشاهده شیفت‌ها",
+        "shifts.manage":   "مدیریت شیفت (باز/بسته)"
     })
 
     readonly property var filteredAdmins: {

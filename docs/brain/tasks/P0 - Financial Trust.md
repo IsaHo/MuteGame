@@ -21,10 +21,13 @@
 
 ### 2. Shifts
 
-- `shifts`: opened_at/by، opening_cash، closed_at/by، counted_cash، expected_cash، variance، status.
-- فقط یک shift باز در هر location.
-- mutationهای نقدی به shift باز reference شوند.
-- close preview قبل از commit نهایی.
+- [x] جدول `shifts` با اپراتور، موجودی اول، موجودی مورد انتظار، شمارش نهایی، اختلاف و snapshot جزئیات.
+- [x] تضمین دیتابیسی فقط یک شیفت باز.
+- [x] اتصال شارژ، پرداخت بدهی، سفارش تأییدشده و هزینه به شیفت جاری.
+- [x] تفکیک نقد، کارت، انتقال و کیف پول در گزارش شیفت.
+- [x] پیش‌نمایش بستن و ثبت نهایی idempotent با audit اتمیک.
+- [x] رابط ساده بازکردن، بستن و تاریخچه شیفت در AccountingPage.
+- [x] ۴۸ تست خودکار مالی و شیفت در مجموع.
 
 ### 3. Reconciliation
 

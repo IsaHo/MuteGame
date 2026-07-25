@@ -16,6 +16,7 @@ const networkRoutes = require('./routes/network');
 const adminsRoutes = require('./routes/admins');
 const auditRoutes = require('./routes/audit');
 const expensesRoutes = require('./routes/expenses');
+const shiftsRoutes   = require('./routes/shifts');
 const { attachAdmin, audit } = require('./audit');
 
 // Shared secret loader: validates the env var and refuses to boot if missing
@@ -98,6 +99,7 @@ app.use('/api/network', networkRoutes);
 app.use('/api/admins', adminsRoutes);
 app.use('/api/audit', auditRoutes);
 app.use('/api/expenses', expensesRoutes);
+app.use('/api/shifts',   shiftsRoutes);
 
 app.get('/api/admin-ip', (req, res) => {
   res.json({ adminIp: getAdminIp(), yourIp: normalizeIp(req.ip) });

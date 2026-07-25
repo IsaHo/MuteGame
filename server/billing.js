@@ -156,6 +156,7 @@ function _writeLedgerRow(db, {
   c_before, c_after, d_before, d_after,
   rate_per_hour, multiplier, tick_seconds,
   admin_id, description,
+  shift_id = null, payment_method = null, payment_amount = null,
 }) {
   if (!VALID_EVENT_TYPES.has(event_type)) {
     throw new RangeError('invalid event_type=' + event_type);
@@ -166,8 +167,8 @@ function _writeLedgerRow(db, {
     + 'amount_credits, amount_debt, '
     + 'credits_before, credits_after, debt_before, debt_after, '
     + 'rate_per_hour, multiplier, tick_seconds, '
-    + 'admin_id, description'
-    + ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    + 'admin_id, description, shift_id, payment_method, payment_amount'
+    + ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).run(
     user_id, session_id || null, event_type,
     credits_delta, debt_delta,
@@ -176,7 +177,10 @@ function _writeLedgerRow(db, {
     multiplier == null ? null : multiplier,
     tick_seconds == null ? null : tick_seconds,
     admin_id || null,
-    description || null
+    description || null,
+    shift_id || null,
+    payment_method || null,
+    payment_amount == null ? null : payment_amount
   );
 }
 
@@ -197,6 +201,7 @@ function _applyChargeLocked(db, {
   user_id, session_id, amount, event_type, mode,
   rate_per_hour, multiplier, tick_seconds,
   description, ctx,
+  shift_id = null, payment_method = null,
 }) {
   if (!(amount > 0)) throw new RangeError('_applyChargeLocked: amount must be > 0, got ' + amount);
   if (mode !== 'strict' && mode !== 'partial') {
@@ -229,7 +234,7 @@ function _applyChargeLocked(db, {
       c_before, c_after, d_before, d_after,
       rate_per_hour, multiplier, tick_seconds,
       admin_id: ctx && ctx.admin_id,
-      description,
+      description, shift_id, payment_method,
     });
     return { credits_delta: 0, debt_delta: amount, c_after, d_after, shortfall: 0 };
   }
@@ -278,7 +283,7 @@ function _applyChargeLocked(db, {
     c_before, c_after, d_before, d_after,
     rate_per_hour, multiplier, tick_seconds,
     admin_id: ctx && ctx.admin_id,
-    description,
+    description, shift_id, payment_method,
   });
 
   return { credits_delta, debt_delta, c_after, d_after, shortfall };
@@ -455,14 +460,14 @@ function closeSession(db, { session_id, end_reason, ctx = {}, now = new Date() }
  *
  * Returns: { credits_after, debt_after, credits_delta, debt_delta, shortfall }
  */
-function chargeUser(db, { user_id, amount, event_type, description, ctx = {}, session_id = null, mode = 'strict' }) {
+function chargeUser(db, { user_id, amount, event_type, description, ctx = {}, session_id = null, mode = 'strict', shift_id = null, payment_method = null }) {
   if (!['shop', 'manual_debit', 'debt_add'].includes(event_type)) {
     throw new RangeError('chargeUser: event_type ' + event_type + ' not allowed on debit path');
   }
   return db.transaction(() => _applyChargeLocked(db, {
     user_id, session_id, amount, event_type, mode,
     rate_per_hour: null, multiplier: null, tick_seconds: null,
-    description, ctx,
+    description, ctx, shift_id, payment_method,
   })).immediate();
 }
 
@@ -474,7 +479,7 @@ function chargeUser(db, { user_id, amount, event_type, description, ctx = {}, se
  *
  * Returns: { credits_after, debt_after, credits_added, debt_paid }
  */
-function creditUser(db, { user_id, amount, event_type, description, ctx = {} }) {
+function creditUser(db, { user_id, amount, event_type, description, ctx = {}, shift_id = null, payment_method = null, payment_amount = null }) {
   if (!(amount > 0)) throw new RangeError('creditUser: amount must be > 0, got ' + amount);
   if (!['recharge', 'debt_pay', 'manual_credit'].includes(event_type)) {
     throw new RangeError('creditUser: event_type ' + event_type + ' not allowed on credit path');
@@ -517,7 +522,7 @@ function creditUser(db, { user_id, amount, event_type, description, ctx = {} }) 
       c_before, c_after, d_before, d_after,
       rate_per_hour: null, multiplier: null, tick_seconds: null,
       admin_id: ctx && ctx.admin_id,
-      description,
+      description, shift_id, payment_method, payment_amount,
     });
 
     return {

@@ -28,7 +28,12 @@ Item {
 
     // ── State ────────────────────────────────────────────────────────
     property int    period: 30           // 0 = today, else N days
-    property int    tabIndex: 0          // 0 income · 1 expense · 2 debt
+    property int    tabIndex: 0          // 0 income · 1 expense · 2 debt · 3 shift
+
+    // ── Shift state ─────────────────────────────────────────────────
+    property var    shiftData:     null   // null=no open shift, object=current open shift
+    property var    shiftPreview:  null   // previewShift response body
+    property var    shiftHistory:  []     // recent closed+open shifts
 
     property var revenueRows:    []
     property var shopRows:       []
@@ -74,6 +79,10 @@ Item {
     }
 
     // ── Polling ──────────────────────────────────────────────────────
+    function refreshShift() {
+        Api.getOpenShift()
+        Api.getShifts(10)
+    }
     function refreshExpenses() {
         const today = new Date().toISOString().split('T')[0]
         if (page.period === 0) {
@@ -99,6 +108,7 @@ Item {
 
     Component.onCompleted: {
         refresh()
+        refreshShift()
         // One-time migration: import local QSettings expenses to server.
         // Runs only if flag is not set. Empty store marks as done immediately.
         // On network failure nothing is marked — retry happens next login.
@@ -139,6 +149,18 @@ Item {
         function onGetExpensesDone(ok, body) {
             if (ok) page.serverExpenses = body.expenses || []
         }
+        function onOpenShiftLoaded(shift)    { page.shiftData = shift }
+        function onOpenShiftNotFound()       { page.shiftData = null }
+        function onShiftOpened(shift)        { page.shiftData = shift; page.shiftPreview = null; page.refreshShift(); toast.show("شیفت باز شد ✅", "success") }
+        function onOpenShiftFailed(err)      { toast.show(err || "خطا در باز کردن شیفت", "error") }
+        function onShiftPreviewReady(p)      { page.shiftPreview = p }
+        function onShiftPreviewFailed(err)   { toast.show(err || "خطا در پیش‌نمایش", "error") }
+        function onShiftClosed(shift, already) {
+            page.shiftData = null; page.shiftPreview = null; page.refreshShift()
+            toast.show(already ? "شیفت قبلاً بسته شده بود" : "شیفت بسته شد ✅", "success")
+        }
+        function onShiftCloseFailed(err)     { toast.show(err || "خطا در بستن شیفت", "error") }
+        function onShiftsLoaded(arr)         { page.shiftHistory = arr }
         function onCreateExpenseDone(ok, body) {
             if (ok) { toast.show("ثبت شد ✅", "success"); expForm.reset(); page.refreshExpenses() }
             else toast.show(body.error || "خطا در ثبت هزینه", "error")
@@ -277,7 +299,8 @@ Item {
                 model: [
                     { key: 0, label: "💰 درآمد",  color: Theme.green },
                     { key: 1, label: "💸 هزینه",  color: Theme.amber },
-                    { key: 2, label: "💳 بدهی",   color: Theme.red }
+                    { key: 2, label: "💳 بدهی",   color: Theme.red },
+                    { key: 3, label: "🔄 شیفت",   color: Theme.violet }
                 ]
                 delegate: Rectangle {
                     height: 38; radius: 12
@@ -638,6 +661,28 @@ Item {
                             placeholder: "مبلغ (ریال)"
                             numeric: true
                             text: expForm.amount
+                        }
+
+                        // Payment method selector
+                        Row {
+                            spacing: 4
+                            Repeater {
+                                model: [
+                                    { key: "cash",     label: "💵" },
+                                    { key: "card",     label: "💳" },
+                                    { key: "transfer", label: "🏦" }
+                                ]
+                                delegate: Rectangle {
+                                    width: 36; height: 46; radius: 8
+                                    property bool active: expForm.paymentMethod === modelData.key
+                                    color: active ? Qt.rgba(0.55,0.36,0.96,0.18) : Theme.bg2
+                                    border.color: active ? Qt.rgba(0.55,0.36,0.96,0.40) : Theme.border
+                                    border.width: 1
+                                    Behavior on color { ColorAnimation { duration: 120 } }
+                                    Text { anchors.centerIn: parent; text: modelData.label; font.pixelSize: 14 }
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: expForm.paymentMethod = modelData.key }
+                                }
+                            }
                         }
 
                         // Submit
@@ -1079,17 +1124,217 @@ Item {
                     }
                 }
             }
+
+            // ────────── Tab 3 — شیفت صندوق ──────────
+            ColumnLayout {
+                spacing: 14
+
+                GlassCard {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: page.shiftData ? 190 : 170
+                    accent: page.shiftData ? Theme.green : Theme.amber
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 18
+                        spacing: 12
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: page.shiftData ? "🟢 شیفت صندوق باز است" : "🟠 شیفت صندوق باز نیست"
+                                color: page.shiftData ? Theme.green : Theme.amber
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 16
+                                font.weight: Font.Bold
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text {
+                                visible: page.shiftData !== null
+                                text: page.shiftData ? ("#" + page.shiftData.id + " · " + (page.shiftData.opened_by_name || "")) : ""
+                                color: Theme.text2
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 12
+                            }
+                        }
+
+                        RowLayout {
+                            visible: page.shiftData === null
+                            Layout.fillWidth: true
+                            spacing: 10
+                            GlassInput {
+                                id: openingCashInput
+                                Layout.fillWidth: true
+                                label: "موجودی اول صندوق (تومان)"
+                                placeholder: "مثلاً 500,000"
+                                numeric: true
+                            }
+                            GlassButton {
+                                Layout.alignment: Qt.AlignBottom
+                                text: "باز کردن شیفت"
+                                onClicked: {
+                                    const toman = Number(openingCashInput.rawDigits) || 0
+                                    Api.openShift(toman * 10)
+                                }
+                            }
+                        }
+
+                        RowLayout {
+                            visible: page.shiftData !== null
+                            Layout.fillWidth: true
+                            spacing: 14
+                            Text {
+                                text: "موجودی اول: " + Currency.format(Number(page.shiftData ? page.shiftData.opening_cash : 0))
+                                color: Theme.text
+                                font.family: Theme.fontFamily
+                                font.pixelSize: 13
+                            }
+                            Item { Layout.fillWidth: true }
+                            GlassButton {
+                                text: "پیش‌نمایش بستن"
+                                variant: "danger"
+                                onClicked: if (page.shiftData) Api.previewShift(page.shiftData.id)
+                            }
+                        }
+                    }
+                }
+
+                GlassCard {
+                    visible: page.shiftPreview !== null
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 245
+                    accent: Theme.red
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 18
+                        spacing: 10
+                        Text {
+                            text: "پیش‌نمایش بستن شیفت"
+                            color: Theme.text
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 16
+                            font.weight: Font.Bold
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 18
+                            Text { text: "نقد ورودی: " + Currency.format(Number(page.shiftPreview?.totals?.total_cash_in || 0)); color: Theme.green; font.family: Theme.fontFamily }
+                            Text { text: "هزینه نقدی: " + Currency.format(Number(page.shiftPreview?.totals?.total_cash_out || 0)); color: Theme.red; font.family: Theme.fontFamily }
+                            Text { text: "موجودی مورد انتظار: " + Currency.format(Number(page.shiftPreview?.expected_cash || 0)); color: Theme.amber; font.family: Theme.fontFamily; font.weight: Font.Bold }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            GlassInput {
+                                id: countedCashInput
+                                Layout.fillWidth: true
+                                label: "موجودی شمارش‌شده (تومان)"
+                                numeric: true
+                            }
+                            GlassInput {
+                                id: closeNoteInput
+                                Layout.fillWidth: true
+                                label: "یادداشت اختلاف (اختیاری)"
+                                placeholder: "توضیح کوتاه"
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Item { Layout.fillWidth: true }
+                            GlassButton { text: "انصراف"; variant: "ghost"; onClicked: page.shiftPreview = null }
+                            GlassButton {
+                                text: "ثبت و بستن شیفت"
+                                variant: "danger"
+                                onClicked: {
+                                    if (!page.shiftData) return
+                                    if (countedCashInput.rawDigits.length === 0) {
+                                        toast.show("موجودی شمارش‌شده را وارد کن", "error")
+                                        return
+                                    }
+                                    const toman = Number(countedCashInput.rawDigits)
+                                    if (!Number.isFinite(toman) || toman < 0) {
+                                        toast.show("موجودی شمارش‌شده معتبر نیست", "error")
+                                        return
+                                    }
+                                    Api.closeShift(page.shiftData.id, toman * 10, closeNoteInput.text.trim())
+                                }
+                            }
+                        }
+                    }
+                }
+
+                GlassCard {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    accent: Theme.violet
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 16
+                        spacing: 8
+                        Text {
+                            text: "تاریخچه اخیر شیفت‌ها"
+                            color: Theme.text
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 15
+                            font.weight: Font.Bold
+                        }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.border }
+                        Text {
+                            visible: page.shiftHistory.length === 0
+                            Layout.alignment: Qt.AlignCenter
+                            text: "هنوز شیفتی ثبت نشده"
+                            color: Theme.text3
+                            font.family: Theme.fontFamily
+                        }
+                        ListView {
+                            visible: page.shiftHistory.length > 0
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            spacing: 4
+                            model: page.shiftHistory
+                            delegate: Rectangle {
+                                width: ListView.view.width
+                                height: 46
+                                radius: 6
+                                color: "transparent"
+                                border.color: Theme.border
+                                border.width: 1
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.margins: 10
+                                    Text { text: "#" + modelData.id; color: Theme.text; font.family: Theme.fontFamilyEn; font.weight: Font.Bold }
+                                    Text { text: modelData.opened_by_name || "—"; color: Theme.text2; font.family: Theme.fontFamily }
+                                    Text { text: modelData.status === "open" ? "باز" : "بسته"; color: modelData.status === "open" ? Theme.green : Theme.text3; font.family: Theme.fontFamily }
+                                    Item { Layout.fillWidth: true }
+                                    Text {
+                                        text: modelData.status === "closed"
+                                              ? ("اختلاف: " + Currency.format(Number(modelData.variance || 0)))
+                                              : ("اول صندوق: " + Currency.format(Number(modelData.opening_cash || 0)))
+                                        color: Number(modelData.variance || 0) === 0 ? Theme.text2 : Theme.red
+                                        font.family: Theme.fontFamily
+                                    }
+                                    Text { text: Jalali.dateTimeFromIso(modelData.created_at); color: Theme.text3; font.family: Theme.fontFamilyEn; font.pixelSize: 10 }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }   // ColumnLayout root
 
     // ── Form state for the inline expense bar ───────────────────────
     QtObject {
         id: expForm
-        property string gregorianIso: new Date().toISOString().split('T')[0]
-        property string category:     "سایر"
-        property string desc:         ""
-        property string amount:       ""
-        property int    editId:       -1   // server expense id; -1 = create mode
+        property string gregorianIso:   new Date().toISOString().split('T')[0]
+        property string category:       "سایر"
+        property string paymentMethod:  "cash"
+        property string desc:           ""
+        property string amount:         ""
+        property int    editId:         -1   // server expense id; -1 = create mode
 
         function reset() {
             const today = new Date().toISOString().split('T')[0];
@@ -1097,6 +1342,7 @@ Item {
             desc = "";   descInput.text   = "";
             amount = ""; amountInput.text = "";
             category = "سایر";
+            paymentMethod = "cash";
             editId = -1;
         }
         function parsedAmount() { return Number(String(amountInput.text).replace(/,/g, "")) || 0 }
@@ -1105,7 +1351,8 @@ Item {
                 date: gregorianIso,
                 category: category,
                 desc: descInput.text,
-                amount: parsedAmount()
+                amount: parsedAmount(),
+                payment_method: paymentMethod
             };
         }
         function submit() {
@@ -1165,6 +1412,7 @@ Item {
         property string fullName: ""
         property real   currentDebtRial: 0
         property int    amountToman: 0
+        property string paymentMethod: "cash"
 
         MouseArea { anchors.fill: parent; onClicked: payDebtModal.open = false }
         Rectangle {
@@ -1201,6 +1449,22 @@ Item {
                         text: Number(payDebtModal.amountToman).toLocaleString(Qt.locale("en_US"), 'f', 0)
                     }
                 }
+                RowLayout { Layout.fillWidth: true; spacing: 6
+                    Repeater {
+                        model: [
+                            { key: "cash",     label: "💵 نقد" },
+                            { key: "card",     label: "💳 کارت" },
+                            { key: "transfer", label: "🏦 انتقال" }
+                        ]
+                        delegate: GlassButton {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 34
+                            text: modelData.label
+                            variant: payDebtModal.paymentMethod === modelData.key ? "primary" : "ghost"
+                            onClicked: payDebtModal.paymentMethod = modelData.key
+                        }
+                    }
+                }
                 RowLayout { Layout.fillWidth: true; spacing: 10
                     GlassButton { Layout.fillWidth: true; text: "انصراف"; variant: "ghost"; onClicked: payDebtModal.open = false }
                     GlassButton {
@@ -1210,7 +1474,7 @@ Item {
                         onClicked: {
                             const t = Number(String(pdInput.text).replace(/,/g, "")) || 0;
                             if (t <= 0) { toast.show("مبلغ معتبر وارد کن", "error"); return; }
-                            Api.payDebt(payDebtModal.userId, t * 10, "پرداخت بدهی از حسابداری");
+                            Api.payDebt(payDebtModal.userId, t * 10, "پرداخت بدهی از حسابداری", payDebtModal.paymentMethod);
                             payDebtModal.open = false;
                         }
                     }

@@ -4,6 +4,7 @@ const express = require('express');
 const { getDb }       = require('../database');
 const { requireAdmin, audit } = require('../audit');
 const svc             = require('../expense-service');
+const { getOpenShiftId } = require('../shift-service');
 
 const router = express.Router();
 
@@ -56,7 +57,8 @@ router.post('/import', requireAdmin('users.financial'), (req, res) => {
 router.post('/', requireAdmin('users.financial'), (req, res) => {
     const db = getDb();
     try {
-        const r = svc.createExpense(db, req.body, req.admin, makeAuditFn(req));
+        // Pass getOpenShiftId as a function so it resolves inside the transaction.
+        const r = svc.createExpense(db, req.body, req.admin, makeAuditFn(req), getOpenShiftId);
         res.status(r.status).json(r.body);
     } catch (e) {
         console.error('[expenses] create:', e.message);

@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert   = require('node:assert/strict');
 const Database = require('better-sqlite3');
 
-const { applyExpensesSchema } = require('../database');
+const { applyExpensesSchema, applyShiftSchema } = require('../database');
 const {
     createExpense, updateExpense, voidExpense,
     importExpenses, getExpenses,
@@ -29,6 +29,7 @@ function createTestDb() {
         )
     `);
     applyExpensesSchema(db);
+    applyShiftSchema(db);
     return db;
 }
 
@@ -263,6 +264,35 @@ test('createExpense and updateExpense persist trimmed category', () => {
     }, ADMIN, af);
     assert.equal(u.status, 200);
     assert.equal(u.body.expense.category, 'برق', 'updateExpense must trim category');
+});
+
+// T15 — shift_id resolved inside transaction via injected function
+test('createExpense with getShiftIdFn resolves shift_id from open shift atomically', () => {
+    const db = createTestDb();
+    const af = makeAuditFn(db);
+
+    // Open a shift directly (applyShiftSchema created the shifts table)
+    db.prepare(
+      "INSERT INTO shifts (status, opened_by_id, opened_by_name, opening_cash) VALUES ('open', 1, 'test', 0)"
+    ).run();
+    const openShift = db.prepare("SELECT id FROM shifts WHERE status = 'open'").get();
+    assert.ok(openShift, 'shift must exist');
+
+    const getShiftIdFn = (db) => {
+        const row = db.prepare("SELECT id FROM shifts WHERE status = 'open'").get();
+        return row ? row.id : null;
+    };
+
+    const r = createExpense(
+        db,
+        { date: '2026-07-25', amount: 10000 },
+        ADMIN, af,
+        getShiftIdFn
+    );
+    assert.equal(r.status, 201);
+
+    const row = db.prepare('SELECT shift_id FROM expenses WHERE id = ?').get(r.body.expense.id);
+    assert.equal(row.shift_id, openShift.id, 'expense must be attached to the currently open shift');
 });
 
 // T9

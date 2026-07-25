@@ -57,10 +57,10 @@ public:
     Q_INVOKABLE void updateUser(int id, const QJsonObject &data);
     Q_INVOKABLE void toggleUser(int id);
     Q_INVOKABLE void deleteUser(int id);
-    Q_INVOKABLE void chargeUser(int id, qint64 amount, const QString &description, bool free = false);
+    Q_INVOKABLE void chargeUser(int id, qint64 amount, const QString &description, bool free = false, const QString &paymentMethod = QString());
     Q_INVOKABLE void dechargeUser(int id, qint64 amount, const QString &description);
     Q_INVOKABLE void addDebt(int id, qint64 amount, const QString &description);
-    Q_INVOKABLE void payDebt(int id, qint64 amount, const QString &description);
+    Q_INVOKABLE void payDebt(int id, qint64 amount, const QString &description, const QString &paymentMethod = QString());
     Q_INVOKABLE void togglePostPay(int id, int value = -1);
     Q_INVOKABLE void getUserTransactions(int id);
 
@@ -139,6 +139,13 @@ public:
     Q_INVOKABLE void voidExpense(int id, const QString &reason);
     Q_INVOKABLE void importExpenses(const QJsonArray &items);
 
+    // ── Shifts ────────────────────────────────────────────────────────
+    Q_INVOKABLE void openShift(int openingCash);
+    Q_INVOKABLE void getOpenShift();
+    Q_INVOKABLE void previewShift(int shiftId);
+    Q_INVOKABLE void closeShift(int shiftId, int countedCash, const QString &closeNote);
+    Q_INVOKABLE void getShifts(int limit = 20);
+
     // ── Admins ────────────────────────────────────────────────────────
     Q_INVOKABLE void getAdmins();
     Q_INVOKABLE void createAdmin(const QJsonObject &data);
@@ -197,6 +204,16 @@ signals:
     void adminMutationDone(bool ok, const QString &error);
     void meDone(const QJsonObject &me);
     void networkError(const QString &message);
+
+    void shiftOpened(QJsonObject shift);
+    void openShiftFailed(QString error);
+    void openShiftLoaded(QJsonObject shift);
+    void openShiftNotFound();
+    void shiftPreviewReady(QJsonObject preview);
+    void shiftPreviewFailed(QString error);
+    void shiftClosed(QJsonObject shift, bool alreadyClosed);
+    void shiftCloseFailed(QString error);
+    void shiftsLoaded(QJsonArray shifts);
 
 private:
     QNetworkRequest buildRequest(const QString &path) const;

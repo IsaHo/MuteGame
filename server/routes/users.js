@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const { getDb } = require('../database');
 const billing = require('../billing');
 const { audit } = require('../audit');
+const { getOpenShiftId } = require('../shift-service');
 
 // Lazy-load: middlewares are registered on app and we read them at request time.
 // Enforces JWT-decoded admin role first (primary auth), then admin-IP pinning
@@ -265,20 +266,27 @@ router.post('/:id/post-pay', adminIpGuard, (req, res) => {
 
 // Charge (add credits) with tier/individual discount
 router.post('/:id/charge', adminIpGuard, (req, res) => {
-  const { amount, description, free = false } = req.body;
+  const { amount, description, free = false, payment_method } = req.body;
   const db = getDb();
   const userId = Number(req.params.id);
   const adminCtx = { admin_id: req.admin && req.admin.id };
+
+  // Validate payment_method for paid charges
+  const pm = payment_method || 'cash';
+  if (!free && !['cash', 'card', 'transfer'].includes(pm)) {
+    return res.status(400).json({ error: 'روش پرداخت باید یکی از: cash، card، transfer باشد' });
+  }
 
   // Free charge: skip discount logic (it's already a gift) and don't bump
   // total_spent (which feeds tier rankings). Maps to 'manual_credit'
   // (credits-only, no debt-pay-first) per the C3 preflight decision.
   if (free) {
     const amt = Number(amount);
-    if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+    if (!Number.isSafeInteger(amt) || amt <= 0) return res.status(400).json({ error: 'مبلغ نامعتبر' });
     const desc = description || '🎁 شارژ رایگان (هدیه ادمین)';
     let result;
     db.transaction(() => {
+      // Free gifts don't have payment_method or shift_id (no cash moves)
       result = billing.creditUser(db, {
         user_id: userId, amount: amt,
         event_type: 'manual_credit', description: desc,
@@ -291,7 +299,7 @@ router.post('/:id/charge', adminIpGuard, (req, res) => {
   }
 
   const requested = Number(amount);
-  if (!(requested > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  if (!Number.isSafeInteger(requested) || requested <= 0) return res.status(400).json({ error: 'مبلغ نامعتبر' });
   const { total, bonus, discount } = applyDiscount(db, userId, requested);
 
   const desc = description || (bonus > 0
@@ -300,19 +308,24 @@ router.post('/:id/charge', adminIpGuard, (req, res) => {
 
   let result;
   db.transaction(() => {
+    const shift_id = getOpenShiftId(db);
     // 'recharge' pays outstanding debt first then deposits remainder to
     // credits — matches the C3 preflight decision (Q3). Operator can
     // top up + settle debt in one action.
     result = billing.creditUser(db, {
       user_id: userId, amount: total,
       event_type: 'recharge', description: desc,
-      ctx: adminCtx,
+      ctx: adminCtx, shift_id, payment_method: pm, payment_amount: requested,
     });
     // total_spent denorm bump (Q2). Tracks cumulative cash paid by the
     // customer; feeds tier rankings. Bumps by the ORIGINAL requested
     // amount, not total (bonus is not customer-paid cash).
     db.prepare('UPDATE users SET total_spent = total_spent + ? WHERE id = ?').run(requested, userId);
-    audit(req, 'user.charge', 'user', userId, { requested, total, bonus, discount, description: desc, debt_paid: result.debt_paid, credits_added: result.credits_added });
+    audit(req, 'user.charge', 'user', userId, {
+      requested, total, bonus, discount, description: desc,
+      debt_paid: result.debt_paid, credits_added: result.credits_added,
+      payment_method: pm, shift_id: shift_id || null,
+    });
   })();
   syncClientCredits(req, userId, result.credits_after, result.debt_after);
   res.json({ credits: result.credits_after, bonus, discount });
@@ -326,7 +339,7 @@ router.post('/:id/decharge', adminIpGuard, (req, res) => {
   const { amount, description = 'کاهش شارژ توسط ادمین' } = req.body;
   const db = getDb();
   const amt = Number(amount);
-  if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  if (!Number.isSafeInteger(amt) || amt <= 0) return res.status(400).json({ error: 'مبلغ نامعتبر' });
   const userId = Number(req.params.id);
   const adminCtx = { admin_id: req.admin && req.admin.id };
   let result;
@@ -381,23 +394,31 @@ router.post('/:id/debt/add', adminIpGuard, (req, res) => {
 // the old MAX(0, debt - amount) semantic). debt_since is cleared on the
 // debt→0 transition (denorm follow-up).
 router.post('/:id/debt/pay', adminIpGuard, (req, res) => {
-  const { amount, description = 'پرداخت بدهی' } = req.body;
+  const { amount, description = 'پرداخت بدهی', payment_method } = req.body;
   const db = getDb();
   const amt = Number(amount);
   if (!(amt > 0)) return res.status(400).json({ error: 'مبلغ نامعتبر' });
+  const pm = payment_method || 'cash';
+  if (!['cash', 'card', 'transfer'].includes(pm)) {
+    return res.status(400).json({ error: 'روش پرداخت باید یکی از: cash، card، transfer باشد' });
+  }
   const userId = Number(req.params.id);
   const adminCtx = { admin_id: req.admin && req.admin.id };
   let result;
   db.transaction(() => {
+    const shift_id = getOpenShiftId(db);
     result = billing.creditUser(db, {
       user_id: userId, amount: amt,
       event_type: 'debt_pay', description,
-      ctx: adminCtx,
+      ctx: adminCtx, shift_id, payment_method: pm,
     });
     if (result.debt_after === 0) {
       db.prepare('UPDATE users SET debt_since = NULL WHERE id = ?').run(userId);
     }
-    audit(req, 'user.debt.pay', 'user', userId, { requested: amt, paid: result.debt_paid, description });
+    audit(req, 'user.debt.pay', 'user', userId, {
+      requested: amt, paid: result.debt_paid, description,
+      payment_method: pm, shift_id: shift_id || null,
+    });
   })();
   notifyClient(req, userId, 'credits:update', { credits: result.credits_after, debt: result.debt_after });
   res.json({ debt: result.debt_after });

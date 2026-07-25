@@ -27,11 +27,18 @@ Rectangle {
     property string op: "charge"
 
     signal closed()
-    signal submitted(string op, var rialAmount, string description)  // var: QML doesn't know qint64
+    signal submitted(string op, var rialAmount, string description, string paymentMethod)  // var: QML doesn't know qint64
+
+    property string paymentMethod: "cash"   // cash | card | transfer
+
+    readonly property bool needsPaymentMethod: op === "charge" || op === "debt_pay"
+
+    onOpChanged: paymentMethod = "cash"   // reset on op switch
 
     onOpenChanged: if (open) {
         amountInput.text = "";
         descInput.text = "";
+        paymentMethod = "cash";
         amountInput.forceActiveFocus();
     }
 
@@ -144,6 +151,27 @@ Rectangle {
                 }
             }
 
+            // Payment method selector — visible for cash operations
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                visible: root.needsPaymentMethod
+                Repeater {
+                    model: [
+                        { key: "cash",     label: "💵 نقد" },
+                        { key: "card",     label: "💳 کارت" },
+                        { key: "transfer", label: "🏦 انتقال" }
+                    ]
+                    delegate: GlassButton {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 34
+                        text: modelData.label
+                        variant: root.paymentMethod === modelData.key ? "primary" : "ghost"
+                        onClicked: root.paymentMethod = modelData.key
+                    }
+                }
+            }
+
             GlassInput {
                 id: amountInput
                 Layout.fillWidth: true
@@ -178,7 +206,8 @@ Rectangle {
         const tomanAmount = Number(amountInput.rawDigits) || 0;
         if (tomanAmount <= 0) return;
         const rial = tomanAmount * 10;
-        root.submitted(root.op, rial, descInput.text.trim());
+        const pm = root.needsPaymentMethod ? root.paymentMethod : "";
+        root.submitted(root.op, rial, descInput.text.trim(), pm);
         root.open = false;
         root.closed();
     }

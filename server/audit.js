@@ -18,6 +18,7 @@ const PERMS = [
   'settings.view', 'settings.edit',
   'admins.view', 'admins.edit',
   'reports.view', 'audit.view',
+  'shifts.view', 'shifts.manage',
 ];
 
 /* Decode JWT and load admin (no enforcement here — endpoints choose what to require) */

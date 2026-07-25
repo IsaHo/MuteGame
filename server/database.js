@@ -440,6 +440,9 @@ function initDatabase() {
   // ─── P0 — expenses table (idempotent) ────────────────────────────────
   applyExpensesSchema(db);
 
+  // ─── P0 — cashier shifts schema (idempotent) ─────────────────────────
+  applyShiftSchema(db);
+
   console.log('✅ Database ready');
 }
 
@@ -1070,4 +1073,73 @@ function applyExpensesSchema(db) {
   `);
 }
 
-module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema, applyExpensesSchema };
+/*
+ * P0 — cashier shifts schema. Idempotent.
+ * Creates the shifts table + partial UNIQUE INDEX (one open shift invariant).
+ * ALTERs credit_ledger, shop_orders, expenses to add shift_id and (ledger)
+ * payment_method columns — safe because credit_ledger triggers are BEFORE
+ * UPDATE/DELETE, not BEFORE INSERT, so ALTER TABLE ADD COLUMN never fires them.
+ */
+function applyShiftSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS shifts (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      status          TEXT    NOT NULL DEFAULT 'open'
+                              CHECK (status IN ('open','closed')),
+      opened_by_id    INTEGER NOT NULL,
+      opened_by_name  TEXT    NOT NULL,
+      opening_cash    INTEGER NOT NULL DEFAULT 0
+                              CHECK (typeof(opening_cash) = 'integer' AND opening_cash >= 0),
+      counted_cash    INTEGER CHECK (counted_cash IS NULL OR (typeof(counted_cash) = 'integer' AND counted_cash >= 0)),
+      expected_cash   INTEGER CHECK (expected_cash IS NULL OR typeof(expected_cash) = 'integer'),
+      variance        INTEGER CHECK (variance IS NULL OR typeof(variance) = 'integer'),
+      close_note      TEXT,
+      close_breakdown TEXT,
+      closed_by_id    INTEGER,
+      closed_by_name  TEXT,
+      closed_at       DATETIME,
+      created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_shift
+      ON shifts (status) WHERE status = 'open';
+    CREATE INDEX IF NOT EXISTS idx_shifts_status ON shifts (status);
+  `);
+
+  // Additive migration for existing DBs missing close_breakdown
+  const shiftCols = db.prepare('PRAGMA table_info(shifts)').all().map(c => c.name);
+  if (!shiftCols.includes('close_breakdown'))
+    db.exec('ALTER TABLE shifts ADD COLUMN close_breakdown TEXT');
+
+  // Additive column migrations — probe each target table before altering.
+  // Guard against tables not existing (e.g. unit-test DBs that only call
+  // a subset of schema functions).
+  const tableExists = (name) =>
+    !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name);
+
+  if (tableExists('credit_ledger')) {
+    const ledgerCols = db.prepare('PRAGMA table_info(credit_ledger)').all().map(c => c.name);
+    if (!ledgerCols.includes('shift_id'))
+      db.exec('ALTER TABLE credit_ledger ADD COLUMN shift_id INTEGER REFERENCES shifts(id)');
+    if (!ledgerCols.includes('payment_method'))
+      db.exec("ALTER TABLE credit_ledger ADD COLUMN payment_method TEXT CHECK (payment_method IS NULL OR payment_method IN ('cash','card','transfer','wallet'))");
+    if (!ledgerCols.includes('payment_amount'))
+      db.exec("ALTER TABLE credit_ledger ADD COLUMN payment_amount INTEGER CHECK (payment_amount IS NULL OR (typeof(payment_amount) = 'integer' AND payment_amount >= 0))");
+    db.exec('CREATE INDEX IF NOT EXISTS idx_credit_ledger_shift ON credit_ledger (shift_id) WHERE shift_id IS NOT NULL');
+  }
+
+  if (tableExists('shop_orders')) {
+    const orderCols = db.prepare('PRAGMA table_info(shop_orders)').all().map(c => c.name);
+    if (!orderCols.includes('shift_id'))
+      db.exec('ALTER TABLE shop_orders ADD COLUMN shift_id INTEGER REFERENCES shifts(id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_shop_orders_shift ON shop_orders (shift_id) WHERE shift_id IS NOT NULL');
+  }
+
+  if (tableExists('expenses')) {
+    const expenseCols = db.prepare('PRAGMA table_info(expenses)').all().map(c => c.name);
+    if (!expenseCols.includes('shift_id'))
+      db.exec('ALTER TABLE expenses ADD COLUMN shift_id INTEGER REFERENCES shifts(id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_expenses_shift ON expenses (shift_id) WHERE shift_id IS NOT NULL');
+  }
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema, applyExpensesSchema, applyShiftSchema };
