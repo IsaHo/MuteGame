@@ -13,6 +13,8 @@
 - [[07 - Research and Competitive Notes|تحقیق رقبا]]
 - [[08 - Design System|سیستم طراحی]]
 - [[09 - Ideas Backlog|بانک ایده‌ها]]
+- [[reports/2026-07-25 - Claude Financial Audit|گزارش ممیزی مالی Claude]]
+- [[tasks/P0 - Financial Trust|اولین milestone اجرایی]]
 - [[CHANGELOG|تاریخچه تغییرات]]
 
 ## تعریف موفقیت

@@ -23,9 +23,9 @@
 
 ## ریسک‌های فعلی
 
-- شاخه `main` نسبت به `origin/main` بیست‌ودو commit جلو است.
+- شاخه `main` تا commit `3fa6b95` با `origin/main` همگام شده است.
 - worktree شامل تغییرات قدیمی و جدید متعدد است.
-- `client/renderer/src/main.jsx` از stash/apply conflict داشته؛ محتوای فعلی ترکیب lockdown و crash reporting است و باید فقط پس از تست mark-resolved شود.
+- conflict فایل `client/renderer/src/main.jsx` با حفظ هر دو قابلیت lockdown و crash reporting mark-resolved شده، اما تغییرات Electron هنوز commit نشده‌اند.
 - فایل‌های تولیدی، `.DS_Store`، دیتابیس و executableها نباید وارد commit سورس شوند.
 - نسل Electron و Qt هم‌زمان وجود دارند؛ Qt مرجع محصول جدید است اما باید migration policy مکتوب بماند.
 
