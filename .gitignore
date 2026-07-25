@@ -8,3 +8,14 @@ admin/dist/
 server-app/admin-dist/
 server-app/node_modules/
 client/dist/
+.DS_Store
+*.zip
+*.exe
+*.command
+*.backup-*
+*.log
+.fuse_hidden*
+_image_previews/
+qt/admin/build/
+qt/client/build/
+qt-prototype/build/
