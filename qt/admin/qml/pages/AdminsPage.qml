@@ -28,7 +28,7 @@ Item {
 
     // Permission catalog (kept in sync with server PERMS + React PERM_GROUPS)
     readonly property var permGroups: [
-        { label: "👥 کاربران",    perms: ["users.view", "users.edit", "users.financial"] },
+        { label: "👥 کاربران",    perms: ["users.view", "users.edit", "users.financial", "users.reconcile"] },
         { label: "🖥 کلاینت‌ها",  perms: ["clients.view", "clients.control"] },
         { label: "🛒 شاپ",        perms: ["shop.view", "shop.edit", "shop.pos"] },
         { label: "🎮 بازی‌ها",    perms: ["games.view", "games.edit"] },
@@ -42,6 +42,7 @@ Item {
         "users.view":      "مشاهده کاربران",
         "users.edit":      "افزودن/ویرایش کاربر",
         "users.financial": "عملیات مالی کاربر",
+        "users.reconcile": "اصلاح مغایرت مالی",
         "clients.view":    "مشاهده کلاینت‌ها",
         "clients.control": "کنترل کلاینت (پیام/اخراج/افزایش)",
         "shop.view":       "مشاهده شاپ",

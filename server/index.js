@@ -15,8 +15,9 @@ const gamesRoutes = require('./routes/games');
 const networkRoutes = require('./routes/network');
 const adminsRoutes = require('./routes/admins');
 const auditRoutes = require('./routes/audit');
-const expensesRoutes = require('./routes/expenses');
-const shiftsRoutes   = require('./routes/shifts');
+const expensesRoutes        = require('./routes/expenses');
+const shiftsRoutes          = require('./routes/shifts');
+const reconciliationRoutes  = require('./routes/reconciliation');
 const { attachAdmin, audit } = require('./audit');
 
 // Shared secret loader: validates the env var and refuses to boot if missing
@@ -98,8 +99,9 @@ app.use('/api/games', gamesRoutes);
 app.use('/api/network', networkRoutes);
 app.use('/api/admins', adminsRoutes);
 app.use('/api/audit', auditRoutes);
-app.use('/api/expenses', expensesRoutes);
-app.use('/api/shifts',   shiftsRoutes);
+app.use('/api/expenses',       expensesRoutes);
+app.use('/api/shifts',        shiftsRoutes);
+app.use('/api/reconciliation', reconciliationRoutes.router);
 
 app.get('/api/admin-ip', (req, res) => {
   res.json({ adminIp: getAdminIp(), yourIp: normalizeIp(req.ip) });

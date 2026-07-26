@@ -1,5 +1,16 @@
 # Brain Changelog
 
+## 2026-07-26 (financial reconciliation)
+
+- گزارش مغایرت، مانده عملیاتی کاربران را با آخرین مانده append-only ledger مقایسه می‌کند.
+- کاربران بدون سابقه ledger به‌عنوان baseline فقط‌خواندنی نمایش داده می‌شوند و drift محسوب نمی‌شوند.
+- اصلاح فقط مانده cache را به ledger برمی‌گرداند؛ عدد هدف دلخواه از اپراتور پذیرفته نمی‌شود.
+- permission مستقل `users.reconcile`، دلیل ۱۰ تا ۵۰۰ کاراکتر، optimistic concurrency و idempotency الزامی است.
+- `reconciliation_log` با triggerهای append-only و boot verification اضافه شد.
+- ledger event، reconciliation log و audit اتمیک هستند؛ Socket sync پس از commit انجام می‌شود.
+- تب «تطبیق حساب» با خلاصه، فیلتر اختلاف، drilldown ledger و پنجره اصلاح به Qt Admin اضافه شد.
+- ۶۴ تست server-side پاس و Qt Admin بدون خطای build ساخته شد.
+
 ## 2026-07-25 (cashier shifts)
 
 - شیفت صندوق server-side با تضمین فقط یک شیفت باز و ثبت audit اتمیک اضافه شد.

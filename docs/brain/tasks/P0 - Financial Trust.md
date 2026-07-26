@@ -31,9 +31,13 @@
 
 ### 3. Reconciliation
 
-- report read-only اختلاف `users` و ledger.
-- عملیات اصلاح فقط با permission ویژه و reason اجباری.
-- هر اصلاح ledger event و audit مستقل.
+- [x] گزارش read-only اختلاف `users` و آخرین مانده ledger.
+- [x] تفکیک وضعیت سالم، اختلاف و baseline قدیمی.
+- [x] اصلاح فقط با `users.reconcile`، دلیل اجباری و optimistic concurrency.
+- [x] idempotency و fingerprint درخواست برای جلوگیری از اصلاح تکراری.
+- [x] ثبت رویداد جبرانی ledger، reconciliation log و audit در یک تراکنش.
+- [x] همگام‌سازی کلاینت متصل فقط پس از commit موفق.
+- [x] تب فارسی تطبیق حساب و پنجره بررسی/اصلاح در Qt Admin.
 
 ### 4. Tests
 
@@ -42,6 +46,9 @@
 - payment method totals.
 - `limit_time` در tick، logout و recovery.
 - crash بین tickها بدون double charge.
+
+سه بخش هزینه‌ها، شیفت و reconciliation تکمیل شده‌اند. موارد باقی‌مانده این P0:
+تست‌های billing مربوط به `limit_time`، logout/recovery و crash بین tickها.
 
 ## خارج از Scope
 

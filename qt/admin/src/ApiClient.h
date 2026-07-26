@@ -146,6 +146,14 @@ public:
     Q_INVOKABLE void closeShift(int shiftId, int countedCash, const QString &closeNote);
     Q_INVOKABLE void getShifts(int limit = 20);
 
+    // ── Reconciliation ────────────────────────────────────────────────
+    Q_INVOKABLE void getReconciliationSummary();
+    Q_INVOKABLE void getReconciliationUsers(bool driftOnly, int limit = 100, int offset = 0);
+    Q_INVOKABLE void getReconciliationLedger(int userId, int limit = 100, int offset = 0);
+    Q_INVOKABLE void correctReconciliation(int userId, const QString &reason,
+                                           double expectedCredits, double expectedDebt,
+                                           int expectedLedgerId);
+
     // ── Admins ────────────────────────────────────────────────────────
     Q_INVOKABLE void getAdmins();
     Q_INVOKABLE void createAdmin(const QJsonObject &data);
@@ -214,6 +222,10 @@ signals:
     void shiftClosed(QJsonObject shift, bool alreadyClosed);
     void shiftCloseFailed(QString error);
     void shiftsLoaded(QJsonArray shifts);
+    void reconciliationSummaryDone(bool ok, QJsonObject body);
+    void reconciliationUsersDone(bool ok, QJsonObject body);
+    void reconciliationLedgerDone(bool ok, QJsonObject body);
+    void reconciliationCorrectionDone(bool ok, QJsonObject body);
 
 private:
     QNetworkRequest buildRequest(const QString &path) const;

@@ -443,6 +443,9 @@ function initDatabase() {
   // ─── P0 — cashier shifts schema (idempotent) ─────────────────────────
   applyShiftSchema(db);
 
+  // ─── P0 — reconciliation_log schema (idempotent) ──────────────────────
+  applyReconciliationSchema(db);
+
   console.log('✅ Database ready');
 }
 
@@ -1142,4 +1145,56 @@ function applyShiftSchema(db) {
   }
 }
 
-module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema, applyExpensesSchema, applyShiftSchema };
+/*
+ * P0 — reconciliation_log. Append-only table that records every operator-
+ * initiated balance correction. Triggers match the pattern of audit_log and
+ * credit_ledger. Boot-time probe refuses startup if triggers are absent.
+ * Idempotent: safe to call on an already-migrated DB.
+ */
+function applyReconciliationSchema(db) {
+  const tableExists = !!db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_log'"
+  ).get();
+
+  if (!tableExists) {
+    db.exec(`
+      CREATE TABLE reconciliation_log (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotency_key       TEXT    UNIQUE NOT NULL,
+        request_fingerprint   TEXT    NOT NULL,
+        user_id               INTEGER NOT NULL REFERENCES users(id),
+        admin_id              INTEGER NOT NULL,
+        reason                TEXT    NOT NULL,
+        credits_before        REAL    NOT NULL,
+        credits_after         REAL    NOT NULL,
+        debt_before           REAL    NOT NULL,
+        debt_after            REAL    NOT NULL,
+        ledger_id             INTEGER NOT NULL REFERENCES credit_ledger(id),
+        correction_ledger_id  INTEGER NOT NULL REFERENCES credit_ledger(id),
+        created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_reconciliation_log_user ON reconciliation_log (user_id);
+      CREATE TRIGGER trg_reconciliation_log_no_update
+        BEFORE UPDATE ON reconciliation_log BEGIN
+          SELECT RAISE(ABORT,'reconciliation_log is append-only'); END;
+      CREATE TRIGGER trg_reconciliation_log_no_delete
+        BEFORE DELETE ON reconciliation_log BEGIN
+          SELECT RAISE(ABORT,'reconciliation_log is append-only'); END;
+    `);
+    console.log('📒 [reconciliation-schema] reconciliation_log created');
+  }
+
+  const wantTriggers = ['trg_reconciliation_log_no_update', 'trg_reconciliation_log_no_delete'];
+  const haveTriggers = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('trg_reconciliation_log_no_update','trg_reconciliation_log_no_delete')"
+  ).all().map(r => r.name);
+  const missing = wantTriggers.filter(t => !haveTriggers.includes(t));
+  if (missing.length) {
+    throw new Error(
+      'reconciliation_log append-only triggers missing: ' + missing.join(', ') +
+      '. Refusing to start.'
+    );
+  }
+}
+
+module.exports = { initDatabase, getDb, prepBillingMigration, applyBillingSchemaV2, applyBillingMigrationPhase3, applyCrashLogSchema, applyExpensesSchema, applyShiftSchema, applyReconciliationSchema };

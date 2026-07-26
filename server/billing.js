@@ -584,7 +584,14 @@ function manualReconciliation(db, { user_id, credits_delta, debt_delta, reason, 
       description: 'reconciliation: ' + reason,
     });
 
-    return { credits_after: c_after, debt_after: d_after };
+    const ledger_id = db.prepare('SELECT MAX(id) AS m FROM credit_ledger WHERE user_id = ?').pluck().get(user_id);
+    return {
+      credits: c_after,
+      debt: d_after,
+      credits_after: c_after,
+      debt_after: d_after,
+      ledger_id,
+    };
   }).immediate();
 }
 

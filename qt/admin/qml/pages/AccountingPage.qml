@@ -28,12 +28,15 @@ Item {
 
     // ── State ────────────────────────────────────────────────────────
     property int    period: 30           // 0 = today, else N days
-    property int    tabIndex: 0          // 0 income · 1 expense · 2 debt · 3 shift
+    property int    tabIndex: 0          // 0 income · 1 expense · 2 debt · 3 shift · 4 reconciliation
 
     // ── Shift state ─────────────────────────────────────────────────
     property var    shiftData:     null   // null=no open shift, object=current open shift
     property var    shiftPreview:  null   // previewShift response body
     property var    shiftHistory:  []     // recent closed+open shifts
+    property var    reconSummary:  ({ total_users: 0, drifted: 0, baseline_only: 0, total_drift_magnitude: 0 })
+    property var    reconRows:     []
+    property bool   reconDriftOnly: false
 
     property var revenueRows:    []
     property var shopRows:       []
@@ -83,6 +86,10 @@ Item {
         Api.getOpenShift()
         Api.getShifts(10)
     }
+    function refreshReconciliation() {
+        Api.getReconciliationSummary()
+        Api.getReconciliationUsers(page.reconDriftOnly, 100, 0)
+    }
     function refreshExpenses() {
         const today = new Date().toISOString().split('T')[0]
         if (page.period === 0) {
@@ -123,6 +130,8 @@ Item {
         }
     }
     onPeriodChanged: refresh()
+    onTabIndexChanged: if (tabIndex === 4) refreshReconciliation()
+    onReconDriftOnlyChanged: if (tabIndex === 4) Api.getReconciliationUsers(reconDriftOnly, 100, 0)
 
     Timer { interval: 60000; running: true; repeat: true; onTriggered: page.refresh() }
 
@@ -161,6 +170,27 @@ Item {
         }
         function onShiftCloseFailed(err)     { toast.show(err || "خطا در بستن شیفت", "error") }
         function onShiftsLoaded(arr)         { page.shiftHistory = arr }
+        function onReconciliationSummaryDone(ok, body) {
+            if (ok) page.reconSummary = body
+            else toast.show(body.error || "خطا در گزارش تطبیق", "error")
+        }
+        function onReconciliationUsersDone(ok, body) {
+            if (ok) page.reconRows = body.rows || []
+            else toast.show(body.error || "خطا در دریافت مغایرت‌ها", "error")
+        }
+        function onReconciliationLedgerDone(ok, body) {
+            if (ok) reconciliationModal.ledgerRows = body.rows || []
+            else toast.show(body.error || "خطا در دریافت دفتر کاربر", "error")
+        }
+        function onReconciliationCorrectionDone(ok, body) {
+            if (ok) {
+                reconciliationModal.open = false
+                toast.show("اصلاح مغایرت ثبت شد ✅", "success")
+                page.refreshReconciliation()
+            } else {
+                toast.show(body.error || "اصلاح مغایرت انجام نشد", "error")
+            }
+        }
         function onCreateExpenseDone(ok, body) {
             if (ok) { toast.show("ثبت شد ✅", "success"); expForm.reset(); page.refreshExpenses() }
             else toast.show(body.error || "خطا در ثبت هزینه", "error")
@@ -300,7 +330,8 @@ Item {
                     { key: 0, label: "💰 درآمد",  color: Theme.green },
                     { key: 1, label: "💸 هزینه",  color: Theme.amber },
                     { key: 2, label: "💳 بدهی",   color: Theme.red },
-                    { key: 3, label: "🔄 شیفت",   color: Theme.violet }
+                    { key: 3, label: "🔄 شیفت",   color: Theme.violet },
+                    { key: 4, label: "⚖ تطبیق حساب", color: Theme.cyan }
                 ]
                 delegate: Rectangle {
                     height: 38; radius: 12
@@ -1323,6 +1354,172 @@ Item {
                     }
                 }
             }
+
+            // ────────── Tab 4 — تطبیق حساب ──────────
+            ColumnLayout {
+                spacing: 14
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns: page.compact ? 2 : 4
+                    columnSpacing: 12
+                    rowSpacing: 12
+                    AccKpi {
+                        Layout.fillWidth: true
+                        iconText: "👥"; label: "کاربران بررسی‌شده"
+                        value: String(page.reconSummary.total_users || 0)
+                        sub: "آخرین مانده ledger"
+                        accent: Theme.cyan
+                    }
+                    AccKpi {
+                        Layout.fillWidth: true
+                        iconText: "⚠"; label: "دارای اختلاف"
+                        value: String(page.reconSummary.drifted || 0)
+                        sub: "نیازمند بررسی"
+                        accent: Theme.red
+                    }
+                    AccKpi {
+                        Layout.fillWidth: true
+                        iconText: "📌"; label: "baseline قدیمی"
+                        value: String(page.reconSummary.baseline_only || 0)
+                        sub: "فقط خواندنی"
+                        accent: Theme.amber
+                    }
+                    AccKpi {
+                        Layout.fillWidth: true
+                        iconText: "Σ"; label: "مجموع قدر مطلق اختلاف"
+                        value: Currency.format(Number(page.reconSummary.total_drift_magnitude || 0))
+                        sub: "شارژ + بدهی"
+                        accent: Theme.violet
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Text {
+                        text: "فقط حساب‌های دارای اختلاف"
+                        color: Theme.text2
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 12
+                    }
+                    Switch {
+                        checked: page.reconDriftOnly
+                        onToggled: page.reconDriftOnly = checked
+                    }
+                    Item { Layout.fillWidth: true }
+                    GlassButton {
+                        text: "بازخوانی"
+                        variant: "ghost"
+                        onClicked: page.refreshReconciliation()
+                    }
+                }
+
+                GlassCard {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    accent: Theme.cyan
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 14
+                        spacing: 8
+                        Text {
+                            text: "وضعیت مانده کاربران"
+                            color: Theme.text
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 15
+                            font.weight: Font.Bold
+                        }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.border }
+                        Text {
+                            visible: page.reconRows.length === 0
+                            Layout.alignment: Qt.AlignCenter
+                            text: "مغایرتی برای نمایش نیست"
+                            color: Theme.text3
+                            font.family: Theme.fontFamily
+                        }
+                        ListView {
+                            visible: page.reconRows.length > 0
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            clip: true
+                            spacing: 4
+                            model: page.reconRows
+                            delegate: Rectangle {
+                                width: ListView.view.width
+                                height: 58
+                                radius: 6
+                                color: "transparent"
+                                border.width: 1
+                                border.color: modelData.status === "drift" ? Qt.rgba(0.94, 0.27, 0.27, 0.45) : Theme.border
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.margins: 10
+                                    spacing: 12
+                                    Column {
+                                        Layout.preferredWidth: 190
+                                        Text {
+                                            width: parent.width
+                                            text: ((modelData.name || "") + " " + (modelData.family || "")).trim() || modelData.username
+                                            color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.Bold
+                                            elide: Text.ElideRight
+                                        }
+                                        Text { text: "@" + (modelData.username || ""); color: Theme.text3; font.family: Theme.fontFamilyEn; font.pixelSize: 10 }
+                                    }
+                                    Text {
+                                        Layout.preferredWidth: 150
+                                        text: "واقعی: " + Currency.format(Number(modelData.actual_credits || 0))
+                                        color: Theme.text2; font.family: Theme.fontFamily; font.pixelSize: 11
+                                    }
+                                    Text {
+                                        Layout.preferredWidth: 150
+                                        text: modelData.status === "baseline"
+                                              ? "ledger: بدون سابقه"
+                                              : "ledger: " + Currency.format(Number(modelData.expected_credits || 0))
+                                        color: Theme.text2; font.family: Theme.fontFamily; font.pixelSize: 11
+                                    }
+                                    Text {
+                                        Layout.preferredWidth: 145
+                                        text: "اختلاف: " + Currency.format(
+                                                  Math.abs(Number(modelData.credits_drift || 0))
+                                                + Math.abs(Number(modelData.debt_drift || 0)))
+                                        color: modelData.status === "drift" ? Theme.red : Theme.text3
+                                        font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.Bold
+                                    }
+                                    Rectangle {
+                                        width: 78; height: 24; radius: 6
+                                        color: modelData.status === "clean" ? Qt.rgba(0.06,0.73,0.51,0.16)
+                                             : modelData.status === "drift" ? Qt.rgba(0.94,0.27,0.27,0.16)
+                                             : Qt.rgba(0.96,0.62,0.04,0.16)
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: modelData.status === "clean" ? "سالم"
+                                                : modelData.status === "drift" ? "اختلاف"
+                                                : "baseline"
+                                            color: modelData.status === "clean" ? Theme.green
+                                                 : modelData.status === "drift" ? Theme.red : Theme.amber
+                                            font.family: Theme.fontFamily; font.pixelSize: 10; font.weight: Font.Bold
+                                        }
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    GlassButton {
+                                        visible: modelData.status === "drift"
+                                        text: "بررسی و اصلاح"
+                                        Layout.preferredHeight: 34
+                                        onClicked: {
+                                            reconciliationModal.userRow = modelData
+                                            reconciliationModal.ledgerRows = []
+                                            reconciliationModal.reason = ""
+                                            reconciliationModal.open = true
+                                            Api.getReconciliationLedger(modelData.id, 20, 0)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }   // ColumnLayout root
 
@@ -1476,6 +1673,148 @@ Item {
                             if (t <= 0) { toast.show("مبلغ معتبر وارد کن", "error"); return; }
                             Api.payDebt(payDebtModal.userId, t * 10, "پرداخت بدهی از حسابداری", payDebtModal.paymentMethod);
                             payDebtModal.open = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: reconciliationModal
+        anchors.fill: parent
+        color: Qt.rgba(0.02, 0.02, 0.06, 0.82)
+        z: 2100
+        visible: open
+        property bool open: false
+        property var userRow: ({})
+        property var ledgerRows: []
+        property string reason: ""
+
+        MouseArea { anchors.fill: parent; onClicked: reconciliationModal.open = false }
+        Rectangle {
+            width: Math.min(620, page.width - 40)
+            height: Math.min(560, page.height - 40)
+            anchors.centerIn: parent
+            radius: 12
+            color: Theme.bg2
+            border.color: Theme.border2
+            border.width: 1
+            MouseArea { anchors.fill: parent }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 22
+                spacing: 12
+
+                Text {
+                    text: "اصلاح کنترل‌شده مغایرت"
+                    color: Theme.text
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 18
+                    font.weight: Font.Bold
+                }
+                Text {
+                    text: ((reconciliationModal.userRow.name || "") + " "
+                           + (reconciliationModal.userRow.family || "")).trim()
+                          + " · @" + (reconciliationModal.userRow.username || "")
+                    color: Theme.text2
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 12
+                }
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns: 2
+                    columnSpacing: 12
+                    rowSpacing: 8
+                    Text {
+                        text: "شارژ فعلی: " + Currency.format(Number(reconciliationModal.userRow.actual_credits || 0))
+                        color: Theme.red; font.family: Theme.fontFamily
+                    }
+                    Text {
+                        text: "شارژ ledger: " + Currency.format(Number(reconciliationModal.userRow.expected_credits || 0))
+                        color: Theme.green; font.family: Theme.fontFamily
+                    }
+                    Text {
+                        text: "بدهی فعلی: " + Currency.format(Number(reconciliationModal.userRow.actual_debt || 0))
+                        color: Theme.red; font.family: Theme.fontFamily
+                    }
+                    Text {
+                        text: "بدهی ledger: " + Currency.format(Number(reconciliationModal.userRow.expected_debt || 0))
+                        color: Theme.green; font.family: Theme.fontFamily
+                    }
+                }
+
+                GlassInput {
+                    id: reconciliationReasonInput
+                    Layout.fillWidth: true
+                    label: "دلیل اصلاح (حداقل ۱۰ کاراکتر)"
+                    placeholder: "مثلاً اختلاف پس از قطع برق و بازیابی سیستم"
+                    text: reconciliationModal.reason
+                    onTextChanged: reconciliationModal.reason = text
+                }
+
+                Text {
+                    text: "آخرین رویدادهای ledger"
+                    color: Theme.text
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 13
+                    font.weight: Font.Bold
+                }
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 3
+                    model: reconciliationModal.ledgerRows
+                    delegate: Rectangle {
+                        width: ListView.view.width
+                        height: 34
+                        radius: 5
+                        color: "transparent"
+                        border.color: Theme.border
+                        border.width: 1
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: 7
+                            Text { text: "#" + modelData.id; color: Theme.text3; font.family: Theme.fontFamilyEn; font.pixelSize: 9 }
+                            Text { text: modelData.event_type || ""; color: Theme.text2; font.family: Theme.fontFamilyEn; font.pixelSize: 10 }
+                            Text {
+                                text: Currency.format(Number(modelData.credits_after || 0))
+                                      + " / بدهی " + Currency.format(Number(modelData.debt_after || 0))
+                                color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 10
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text { text: Jalali.dateTimeFromIso(modelData.created_at); color: Theme.text3; font.family: Theme.fontFamilyEn; font.pixelSize: 9 }
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    GlassButton {
+                        Layout.fillWidth: true
+                        text: "انصراف"
+                        variant: "ghost"
+                        onClicked: reconciliationModal.open = false
+                    }
+                    GlassButton {
+                        Layout.fillWidth: true
+                        text: "ثبت اصلاح"
+                        variant: "danger"
+                        onClicked: {
+                            const reason = reconciliationReasonInput.text.trim()
+                            if (reason.length < 10) {
+                                toast.show("دلیل اصلاح باید حداقل ۱۰ کاراکتر باشد", "error")
+                                return
+                            }
+                            Api.correctReconciliation(
+                                reconciliationModal.userRow.id,
+                                reason,
+                                Number(reconciliationModal.userRow.actual_credits),
+                                Number(reconciliationModal.userRow.actual_debt),
+                                Number(reconciliationModal.userRow.last_ledger_id))
                         }
                     }
                 }

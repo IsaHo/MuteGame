@@ -10,7 +10,7 @@ function normalizeIp(ip) {
 
 /* Permissions catalog — keep in sync with admin UI */
 const PERMS = [
-  'users.view', 'users.edit', 'users.financial',
+  'users.view', 'users.edit', 'users.financial', 'users.reconcile',
   'clients.view', 'clients.control',
   'shop.view', 'shop.edit', 'shop.pos',
   'games.view', 'games.edit',

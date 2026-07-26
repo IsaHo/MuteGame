@@ -917,6 +917,53 @@ void ApiClient::getShifts(int limit)
     });
 }
 
+// ── Reconciliation ───────────────────────────────────────────────────
+void ApiClient::getReconciliationSummary()
+{
+    getJson("/api/reconciliation/summary", [this](QNetworkReply *reply) {
+        QString error; QJsonObject body;
+        emit reconciliationSummaryDone(replyOk(reply, error, body), body);
+    });
+}
+
+void ApiClient::getReconciliationUsers(bool driftOnly, int limit, int offset)
+{
+    const QString path = QString("/api/reconciliation/users?drift_only=%1&limit=%2&offset=%3")
+        .arg(driftOnly ? "true" : "false").arg(limit).arg(offset);
+    getJson(path, [this](QNetworkReply *reply) {
+        QString error; QJsonObject body;
+        emit reconciliationUsersDone(replyOk(reply, error, body), body);
+    });
+}
+
+void ApiClient::getReconciliationLedger(int userId, int limit, int offset)
+{
+    const QString path = QString("/api/reconciliation/users/%1/ledger?limit=%2&offset=%3")
+        .arg(userId).arg(limit).arg(offset);
+    getJson(path, [this](QNetworkReply *reply) {
+        QString error; QJsonObject body;
+        emit reconciliationLedgerDone(replyOk(reply, error, body), body);
+    });
+}
+
+void ApiClient::correctReconciliation(int userId, const QString &reason,
+                                      double expectedCredits, double expectedDebt,
+                                      int expectedLedgerId)
+{
+    const QJsonObject body{
+        { "idempotency_key", QUuid::createUuid().toString(QUuid::WithoutBraces) },
+        { "reason", reason },
+        { "expected_current_credits", expectedCredits },
+        { "expected_current_debt", expectedDebt },
+        { "expected_last_ledger_id", expectedLedgerId },
+    };
+    postJson(QString("/api/reconciliation/users/%1/correct").arg(userId), body,
+             [this](QNetworkReply *reply) {
+        QString error; QJsonObject response;
+        emit reconciliationCorrectionDone(replyOk(reply, error, response), response);
+    });
+}
+
 // ── Admins ────────────────────────────────────────────────────────────
 void ApiClient::getAdmins()
 {
